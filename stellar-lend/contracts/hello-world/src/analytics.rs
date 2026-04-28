@@ -1,7 +1,9 @@
 // src/analytics.rs
 // Off-chain view functions for dashboards and monitoring.
 
-use soroban_sdk::{Address, Env};
+#![allow(unused)]
+use crate::prelude::*;
+use soroban_sdk::{contracterror, contracttype, Address, Env, Map, Symbol, Vec};
 
 use crate::{bad_debt_accounting, storage, types::{LendingError, ProtocolReport}};
 

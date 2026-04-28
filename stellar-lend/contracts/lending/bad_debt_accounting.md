@@ -59,6 +59,8 @@ When `liquidate_position` is called:
 - **Authorization**: `require_auth()` is enforced on all admin functions modifying the insurance fund or writing off debt.
 
 
+
+
 # Bad-Debt Accounting
 
 _StellarLend Protocol — `stellar-lend/contracts/lending/bad_debt_accounting.md`_
