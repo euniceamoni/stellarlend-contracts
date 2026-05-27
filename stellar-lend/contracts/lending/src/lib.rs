@@ -2,6 +2,31 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
+const REENTRANCY_LOCK_KEY: &str = "reentrancy_lock";
+
+fn acquire_reentrancy_lock(env: &Env) {
+    let locked: bool = env
+        .storage()
+        .temporary()
+        .get(&REENTRANCY_LOCK_KEY)
+        .unwrap_or(false);
+    if locked {
+        panic!("reentrant call");
+    }
+    env.storage().temporary().set(&REENTRANCY_LOCK_KEY, &true);
+}
+
+fn release_reentrancy_lock(env: &Env) {
+    env.storage().temporary().remove(&REENTRANCY_LOCK_KEY);
+}
+
+fn with_reentrancy_lock<T>(env: &Env, f: impl FnOnce() -> T) -> T {
+    acquire_reentrancy_lock(env);
+    let result = f();
+    release_reentrancy_lock(env);
+    result
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PositionSummary {
@@ -16,7 +41,9 @@ pub struct LendingContract;
 impl LendingContract {
     /// Initialize the lending contract with an admin.
     pub fn initialize(env: Env, admin: Address) {
-        env.storage().instance().set(&"admin", &admin);
+        with_reentrancy_lock(&env, || {
+            env.storage().instance().set(&"admin", &admin);
+        });
     }
 
     /// Get the configured admin (or panic if uninitialized).
@@ -26,42 +53,50 @@ impl LendingContract {
 
     /// Deposit collateral for a user.
     pub fn deposit(env: Env, user: Address, amount: i128) -> i128 {
-        user.require_auth();
-        let key = ("col", user.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_balance = current + amount;
-        env.storage().persistent().set(&key, &new_balance);
-        new_balance
+        with_reentrancy_lock(&env, || {
+            user.require_auth();
+            let key = ("col", user.clone());
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            let new_balance = current + amount;
+            env.storage().persistent().set(&key, &new_balance);
+            new_balance
+        })
     }
 
     /// Withdraw collateral for a user.
     pub fn withdraw(env: Env, user: Address, amount: i128) -> i128 {
-        user.require_auth();
-        let key = ("col", user.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_balance = current - amount;
-        env.storage().persistent().set(&key, &new_balance);
-        new_balance
+        with_reentrancy_lock(&env, || {
+            user.require_auth();
+            let key = ("col", user.clone());
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            let new_balance = current - amount;
+            env.storage().persistent().set(&key, &new_balance);
+            new_balance
+        })
     }
 
     /// Borrow against deposited collateral.
     pub fn borrow(env: Env, user: Address, amount: i128) -> i128 {
-        user.require_auth();
-        let key = ("debt", user.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_debt = current + amount;
-        env.storage().persistent().set(&key, &new_debt);
-        new_debt
+        with_reentrancy_lock(&env, || {
+            user.require_auth();
+            let key = ("debt", user.clone());
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            let new_debt = current + amount;
+            env.storage().persistent().set(&key, &new_debt);
+            new_debt
+        })
     }
 
     /// Repay debt.
     pub fn repay(env: Env, user: Address, amount: i128) -> i128 {
-        user.require_auth();
-        let key = ("debt", user.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_debt = current - amount;
-        env.storage().persistent().set(&key, &new_debt);
-        new_debt
+        with_reentrancy_lock(&env, || {
+            user.require_auth();
+            let key = ("debt", user.clone());
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            let new_debt = current - amount;
+            env.storage().persistent().set(&key, &new_debt);
+            new_debt
+        })
     }
 
     /// Get the user's current position summary.
@@ -91,6 +126,16 @@ mod test {
     fn setup() -> (Env, LendingContractClient<'static>, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
+        let id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        client.initialize(&admin);
+        (env, client, admin, user)
+    }
+
+    fn setup_without_mocked_auth() -> (Env, LendingContractClient<'static>, Address, Address) {
+        let env = Env::default();
         let id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &id);
         let admin = Address::generate(&env);
@@ -153,5 +198,26 @@ mod test {
         let pos = client.get_position(&user);
         assert_eq!(pos.collateral, 0);
         assert_eq!(pos.debt, 0);
+    }
+
+    #[test]
+    fn test_reentrancy_lock_blocks_nested_mutation() {
+        let (env, client, _admin, user) = setup();
+        client.deposit(&user, &100);
+
+        env.storage().temporary().set(&REENTRANCY_LOCK_KEY, &true);
+        assert!(client.try_withdraw(&user, &10).is_err());
+        env.storage().temporary().remove(&REENTRANCY_LOCK_KEY);
+    }
+
+    #[test]
+    fn test_reentrancy_lock_released_after_revert_path() {
+        let (env, client, _admin, user) = setup_without_mocked_auth();
+
+        assert!(client.try_deposit(&user, &10).is_err());
+
+        env.mock_all_auths();
+        let updated = client.deposit(&user, &10);
+        assert_eq!(updated, 10);
     }
 }
