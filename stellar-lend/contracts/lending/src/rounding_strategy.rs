@@ -2,6 +2,15 @@
 // ROUNDING STRATEGY - Fix interest accrual drift
 // ════════════════════════════════════════════════════════════════
 
+use soroban_sdk::Env;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundingError {
+    Overflow,
+    InvalidParameters,
+    UnacceptableDrift,
+}
+
 /// Rounding strategy for interest calculations
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoundingMode {
@@ -75,10 +84,10 @@ pub fn calculate_interest_with_rounding(
     elapsed_seconds: u64,
     rate_bps: i128,
     mode: RoundingMode,
-) -> Result<InterestCalcResult, &'static str> {
+) -> Result<InterestCalcResult, RoundingError> {
     // Guard: negative amounts
     if borrowed_amount < 0 || rate_bps < 0 {
-        return Err("Invalid parameters: amounts must be non-negative");
+        return Err(RoundingError::InvalidParameters);
     }
 
     // Guard: zero borrowed amount
@@ -92,22 +101,22 @@ pub fn calculate_interest_with_rounding(
     // Step 1: Multiply borrowed_amount * elapsed_seconds
     let amount_times_seconds = borrowed_amount
         .checked_mul(elapsed_seconds as i128)
-        .ok_or("overflow: borrowed_amount * elapsed_seconds")?;
+        .ok_or(RoundingError::Overflow)?;
 
     // Step 2: Multiply by rate_bps
     let amount_times_seconds_times_rate = amount_times_seconds
         .checked_mul(rate_bps)
-        .ok_or("overflow: amount_times_seconds * rate_bps")?;
+        .ok_or(RoundingError::Overflow)?;
 
     // Step 3: Multiply by PRECISION for fractional tracking
     let with_precision = amount_times_seconds_times_rate
         .checked_mul(INTEREST_PRECISION)
-        .ok_or("overflow: adding precision scale")?;
+        .ok_or(RoundingError::Overflow)?;
 
     // Step 4: Divide by denominator
     let denominator = (SECONDS_PER_YEAR as i128)
         .checked_mul(BASIS_POINTS_SCALE)
-        .ok_or("overflow: denominator calculation")?;
+        .ok_or(RoundingError::Overflow)?;
 
     let full_division = with_precision / denominator;
     let remainder = with_precision % denominator;
@@ -180,7 +189,7 @@ pub fn reconcile_debt_with_drift_correction(
     freshly_calculated_debt: i128,
     accumulated_drift: i128,
     max_allowed_drift_bps: i128, // e.g., 10 = 0.1% max drift
-) -> Result<(i128, i128), &'static str> {
+)-> Result<(i128, i128), RoundingError> {
     // Calculate the drift in basis points
     let debt_basis = if stored_debt > 0 {
         (freshly_calculated_debt - stored_debt) * 10000 / stored_debt
@@ -190,7 +199,7 @@ pub fn reconcile_debt_with_drift_correction(
 
     // Check if drift is within acceptable bounds
     if debt_basis.abs() > max_allowed_drift_bps {
-        return Err("Unacceptable debt drift");
+        return Err(RoundingError::UnacceptableDrift);
     }
 
     // Return reconciled debt and updated drift

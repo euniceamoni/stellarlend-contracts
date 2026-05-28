@@ -4,33 +4,16 @@ mod debt;
 pub mod rounding_strategy;
 pub mod debt;
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, Symbol, Bytes, IntoVal, Vec, Val, vec};
-use crate::debt::{DebtPosition, load_debt, repay_amount, save_debt, effective_debt};
+mod debt;
 
-use debt::{
-    borrow_amount, effective_debt, load_debt, repay_amount, save_debt, DebtPosition,
-    DEFAULT_APR_BPS,
-};
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Bytes, Env, IntoVal, Symbol,
-};
+#[cfg(test)]
+extern crate std;
 
-/// Canonical storage namespace for this contract.
-///
-/// Using a single typed enum prevents silent collisions between ad-hoc string
-/// keys and tuple layouts as the contract grows.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Admin,
-    BorrowMinAmount,
-    FlashActive,
-    FlashFeeBps,
-    Collateral(Address),
-    Debt(Address),
-    Balance(Address, Address),
-    Treasury(Address),
-}
+#[cfg(test)]
+mod interest_drift_regression_test;
+
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, Symbol, Bytes};
+use crate::debt::{load_debt, save_debt, repay_amount, DEFAULT_APR_BPS, DebtPosition, effective_debt};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]  // Add Eq here
@@ -45,7 +28,8 @@ pub struct PositionSummary {
 #[repr(u32)]
 pub enum Error {
     BelowMinimumBorrow = 1008,
-    PositionHealthy = 1009,
+    NotInitialized = 1009,
+    AlreadyInitialized = 1010,
 }
 
 #[contract]
@@ -71,36 +55,30 @@ impl EmergencyState {
 
 #[contractimpl]
 impl LendingContract {
-    pub fn initialize(env: Env, admin: Address) {
-        env.storage().instance().set(&DataKey::Admin, &admin);
+    pub fn initialize(env: Env, admin: Address) -> Result<(), LendingError> {
+        // Prevent double-initialization: return a typed error if already initialized.
+        if env.storage().instance().get::<_, Address>(&"admin").is_some() {
+            return Err(LendingError::AlreadyInitialized);
+        }
+        env.storage().instance().set(&"admin", &admin);
+        Ok(())
     }
 
-    pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
-    }
-
-    /// Propose a new admin (current admin only)
-    pub fn propose_admin(env: Env, new_admin: Address) {
-        let current_admin = Self::get_admin(env.clone());
-        current_admin.require_auth();
-        env.storage().instance().set(&"pending_admin", &new_admin);
-    }
-
-    /// Accept the proposed admin role (proposed admin only)
-    pub fn accept_admin(env: Env) {
-        let pending_admin: Address = env.storage().instance().get(&"pending_admin").expect("no pending admin");
-        pending_admin.require_auth();
-        env.storage().instance().set(&"admin", &pending_admin);
-        env.storage().instance().remove(&"pending_admin");
+    /// Return the stored admin address or a typed `LendingError::NotInitialized` if
+    /// the contract has not been initialized yet.
+    pub fn get_admin(env: Env) -> Result<Address, LendingError> {
+        match env.storage().instance().get::<_, Address>(&"admin") {
+            Some(a) => Ok(a),
+            None => Err(LendingError::NotInitialized),
+        }
     }
 
     /// Set the minimum borrow amount (admin-only).
-    pub fn set_min_borrow(env: Env, min_borrow: i128) {
-        let admin = Self::get_admin(env.clone());
+    pub fn set_min_borrow(env: Env, min_borrow: i128) -> Result<(), LendingError> {
+        let admin = Self::get_admin(env.clone())?;
         admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::BorrowMinAmount, &min_borrow);
+        env.storage().instance().set(&Symbol::new(&env, "BorrowMinAmount"), &min_borrow);
+        Ok(())
     }
 
     /// Get the minimum borrow amount.
@@ -225,9 +203,10 @@ impl LendingContract {
         load_debt(&env, &user)
     }
 
-    pub fn set_flash_loan_fee_bps(env: Env, admin: Address, fee_bps: i128) {
+    // Flash loan fee setter (bps). Only admin may call.
+    pub fn set_flash_loan_fee_bps(env: Env, admin: Address, fee_bps: i128) -> Result<(), LendingError> {
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin = Self::get_admin(env.clone())?;
         if stored_admin != admin {
             panic!("Unauthorized");
         }
@@ -235,44 +214,8 @@ impl LendingContract {
         if !(0..=MAX_FEE).contains(&fee_bps) {
             panic!("InvalidFeeBps");
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::FlashFeeBps, &fee_bps);
-    }
-
-    /// Privileged function to update the global emergency state. Only callable by `admin` or `guardian`.
-    pub fn set_emergency_state(env: Env, caller: Address, new_state: EmergencyState) {
-        caller.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&"admin").unwrap();
-        // optional guardian may be present
-        let guardian_key = Symbol::new(&env, "guardian");
-        let guardian: Option<Address> = env.storage().instance().get(&guardian_key).unwrap_or(None);
-        // ensure caller matches admin or guardian
-        let allowed = if caller == stored_admin {
-            true
-        } else if let Some(g) = guardian {
-            g == caller
-        } else {
-            false
-        };
-        if !allowed {
-            panic!("Unauthorized");
-        }
-
-        let old_state: EmergencyState = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "EmergencyState"))
-            .unwrap_or(EmergencyState::Normal);
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "EmergencyState"), &new_state);
-
-        // emit event with (old_state, new_state)
-        env.events().publish(
-            (&Symbol::new(&env, "EmergencyStateChanged"),),
-            (&old_state, &new_state),
-        );
+        env.storage().instance().set(&"flash_fee_bps", &fee_bps);
+        Ok(())
     }
 
     fn get_flash_fee_bps(env: &Env) -> i128 {
@@ -285,9 +228,7 @@ impl LendingContract {
     // Repay function used by receiver during callback to return funds to the contract.
     pub fn repay_flash_loan(env: Env, asset: Address, amount: i128) {
         // Payer must be the invoker (caller contract/account)
-        // Soroban SDK v25 exposes the current contract address here, not the
-        // external invoker identity.
-        let payer = env.current_contract_address();
+        let payer = Env::invoker(&env);
         payer.require_auth();
         // subtract from payer balance
         let payer_key = DataKey::Balance(asset.clone(), payer.clone());
@@ -337,7 +278,7 @@ impl LendingContract {
 
         let method = Symbol::new(&env, "on_flash_loan");
         // Prepare arguments: initiator = caller (invoker)
-        let initiator = env.current_contract_address();
+        let initiator = Env::invoker(&env);
         // Call contract - if it panics, propagate
         env.invoke_contract::<()>(
             &receiver,
@@ -479,57 +420,29 @@ mod test {
     }
 
     #[test]
-    fn test_typed_storage_keys_keep_namespaces_isolated() {
+    fn test_get_admin_before_init() {
         let env = Env::default();
         env.mock_all_auths();
         let id = env.register(LendingContract, ());
-        let user = Address::generate(&env);
-        let asset = Address::generate(&env);
+        let client = LendingContractClient::new(&env, &id);
+        // contract not initialized, try_get_admin should return an error
+        let res = client.try_get_admin();
+        assert!(res.is_err());
+    }
 
-        env.as_contract(&id, || {
-            env.storage().instance().set(&DataKey::Admin, &user);
-            env.storage().instance().set(&DataKey::FlashFeeBps, &7i128);
-            env.storage()
-                .persistent()
-                .set(&DataKey::Collateral(user.clone()), &25i128);
-            env.storage()
-                .persistent()
-                .set(&DataKey::Debt(user.clone()), &40i128);
-            env.storage()
-                .persistent()
-                .set(&DataKey::Balance(asset.clone(), user.clone()), &55i128);
-            env.storage()
-                .persistent()
-                .set(&DataKey::Treasury(asset.clone()), &70i128);
-
-            assert_eq!(
-                env.storage().instance().get(&DataKey::Admin),
-                Some(user.clone())
-            );
-            assert_eq!(
-                env.storage().instance().get(&DataKey::FlashFeeBps),
-                Some(7i128)
-            );
-            assert_eq!(
-                env.storage()
-                    .persistent()
-                    .get(&DataKey::Collateral(user.clone())),
-                Some(25i128)
-            );
-            assert_eq!(
-                env.storage().persistent().get(&DataKey::Debt(user.clone())),
-                Some(40i128)
-            );
-            assert_eq!(
-                env.storage()
-                    .persistent()
-                    .get(&DataKey::Balance(asset.clone(), user.clone())),
-                Some(55i128)
-            );
-            assert_eq!(
-                env.storage().persistent().get(&DataKey::Treasury(asset)),
-                Some(70i128)
-            );
-        });
+    #[test]
+    fn test_double_initialize_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        // first initialize should succeed
+        client.initialize(&admin);
+        // second initialize should return an error
+        let res = client.try_initialize(&admin);
+        assert!(res.is_err());
     }
 }
+
+
