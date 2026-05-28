@@ -9,10 +9,12 @@ mod interest_drift_regression_tests {
     use crate::rounding_strategy::{
         calculate_interest_with_rounding, RoundingMode, SECONDS_PER_YEAR,
     };
+    use soroban_sdk::{Env, log};
 
     /// ✅ Test: 24-month accrual with banker's rounding shows bounded drift
     #[test]
     fn test_24_month_long_horizon_drift_bounded() {
+        let env = Env::default();
         let borrowed = 100_000i128; // $100,000
         let monthly_seconds = SECONDS_PER_YEAR / 12;
         let mut total_interest = 0i128;
@@ -29,7 +31,8 @@ mod interest_drift_regression_tests {
 
             total_interest += result.interest;
 
-            std::println!(
+            log!(
+                &env,
                 "Month {}: monthly interest = {}, total so far = {}",
                 month + 1,
                 result.interest,
@@ -42,9 +45,9 @@ mod interest_drift_regression_tests {
         let expected = 10_000i128;
         let drift = (total_interest - expected).abs();
 
-        std::println!("Total interest accrued: {}", total_interest);
-        std::println!("Expected: {}", expected);
-        std::println!("Drift: {} (max allowed: 20)", drift);
+        log!(&env, "Total interest accrued: {}", total_interest);
+        log!(&env, "Expected: {}", expected);
+        log!(&env, "Drift: {} (max allowed: 5)", drift);
 
         // Banker's rounding should keep drift under 20 units for this scenario
         assert!(
@@ -57,6 +60,7 @@ mod interest_drift_regression_tests {
     /// ✅ Test: 100-month (8+ year) accrual with drift tracking
     #[test]
     fn test_long_horizon_100_months_drift_tracking() {
+        let env = Env::default();
         let borrowed = 50_000i128;
         let monthly_seconds = SECONDS_PER_YEAR / 12;
         let mut total_interest = 0i128;
@@ -75,7 +79,8 @@ mod interest_drift_regression_tests {
             total_drift += result.remainder;
 
             if month % 12 == 11 {
-                std::println!(
+                log!(
+                    &env,
                     "Year {}: YTD interest = {}, accumulated drift = {}",
                     month / 12 + 1,
                     total_interest,
@@ -89,9 +94,9 @@ mod interest_drift_regression_tests {
         let expected_approx = 20_825i128;
         let drift = (total_interest - expected_approx).abs();
 
-        std::println!("Total 100-month interest: {}", total_interest);
-        std::println!("Approx expected: {}", expected_approx);
-        std::println!("Drift: {}", drift);
+        log!(&env, "Total 100-month interest: {}", total_interest);
+        log!(&env, "Approx expected: {}", expected_approx);
+        log!(&env, "Drift: {}", drift);
 
         // Even over 100 months, drift should be bounded
         assert!(
@@ -131,6 +136,7 @@ mod interest_drift_regression_tests {
     /// ✅ Test: Different rounding modes bound drift differently
     #[test]
     fn test_rounding_modes_drift_comparison() {
+        let env = Env::default();
         let borrowed = 1000i128;
         let one_month = SECONDS_PER_YEAR / 12;
 
@@ -151,7 +157,7 @@ mod interest_drift_regression_tests {
 
             // Expected: 1000 * 0.05 = 50
             let drift = (total - 50).abs();
-            std::println!("Mode {:?}: total = {}, drift = {}", mode, total, drift);
+            log!(&env, "Mode {:?}: total = {}, drift = {}", mode, total, drift);
 
             // All modes should have bounded drift
             assert!(drift <= 10, "Excessive drift for {:?}: {}", mode, drift);

@@ -2,8 +2,6 @@
 // ROUNDING STRATEGY - Fix interest accrual drift
 // ════════════════════════════════════════════════════════════════
 
-use soroban_sdk::Env;
-
 /// Rounding strategy for interest calculations
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoundingMode {
@@ -107,7 +105,7 @@ pub fn calculate_interest_with_rounding(
     let remainder = with_precision % denominator;
 
     // Step 5: Apply rounding strategy
-    let (rounded_interest, actual_remainder) = apply_rounding(
+    let (rounded_interest, _actual_remainder) = apply_rounding(
         full_division,
         remainder,
         denominator,
