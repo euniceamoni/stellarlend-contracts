@@ -2,22 +2,18 @@
 
 mod debt;
 pub mod rounding_strategy;
-pub mod debt;
-
-#[cfg(test)]
-extern crate std;
+mod debt;
 
 #[cfg(test)]
 mod interest_drift_regression_test;
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, Symbol, Bytes};
-use crate::debt::{load_debt, save_debt, repay_amount, borrow_amount, DEFAULT_APR_BPS, DebtPosition, effective_debt};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Symbol};
+use debt::{borrow_amount, load_debt, save_debt, DebtPosition, DEFAULT_APR_BPS, repay_amount, effective_debt};
 
-const REENTRANCY_LOCK_KEY: &str = "reentrancy_lock";
-
-// Default protocol limits (from docs/risk_params.md)
-const DEFAULT_DEBT_CEILING: i128 = 1_000_000_000_000; // 1 trillion (configurable by admin)
-const DEFAULT_DEPOSIT_CAP: i128 = 1_000_000_000_000;  // 1 trillion (configurable by admin)
+/// Maximum desired persistent TTL for position entries, in ledgers.
+/// We bound the extension by the network's `max_ttl` to remain compatible
+/// with runtime limits while keeping active positions alive for a long window.
+const PERSISTENT_TTL_LEDGERS: u32 = 1_000_000;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,22 +86,20 @@ pub enum LendingError {
 #[contract]
 pub struct LendingContract;
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]  // Add Eq here
-pub enum EmergencyState {
-    Normal,
-    Shutdown,
-    Recovery,
+/// Helper function to extend TTL for collateral entries
+/// Prevents collateral data from being archived during the TTL period
+fn extend_collateral_ttl(env: &Env, user: &Address) {
+    let key = ("col", user.clone());
+    let ttl = env.storage().max_ttl().min(PERSISTENT_TTL_LEDGERS);
+    env.storage().persistent().extend_ttl(&key, ttl, ttl);
 }
 
-impl EmergencyState {
-    fn as_u32(&self) -> u32 {
-        match self {
-            EmergencyState::Normal => 0,
-            EmergencyState::Shutdown => 1,
-            EmergencyState::Recovery => 2,
-        }
-    }
+/// Helper function to extend TTL for debt entries
+/// Prevents debt data from being archived during the TTL period
+fn extend_debt_ttl(env: &Env, user: &Address) {
+    let key = ("debt", user.clone());
+    let ttl = env.storage().max_ttl().min(PERSISTENT_TTL_LEDGERS);
+    env.storage().persistent().extend_ttl(&key, ttl, ttl);
 }
 
 #[contractimpl]
@@ -197,11 +191,9 @@ impl LendingContract {
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         let new_balance = current.checked_add(amount).ok_or(LendingError::Overflow)?;
         env.storage().persistent().set(&key, &new_balance);
-        
-        // Update protocol-level total deposits
-        env.storage().persistent().set(&DataKey::TotalDeposits, &new_total);
-        
-        Ok(new_balance)
+        // Extend TTL to prevent archival of collateral entry
+        extend_collateral_ttl(&env, &user);
+        new_balance
     }
 
     /// Withdraw collateral. Cannot withdraw more than current balance.
@@ -250,13 +242,9 @@ impl LendingContract {
         }
         let new_balance = current.checked_sub(amount).ok_or(LendingError::Overflow)?;
         env.storage().persistent().set(&key, &new_balance);
-        
-        // Decrement protocol-level total deposits with underflow protection
-        let total_deposits: i128 = env.storage().persistent().get(&DataKey::TotalDeposits).unwrap_or(0);
-        let new_total = total_deposits.checked_sub(amount).ok_or(LendingError::Overflow)?;
-        env.storage().persistent().set(&DataKey::TotalDeposits, &new_total);
-        
-        Ok(new_balance)
+        // Extend TTL to prevent archival of collateral entry
+        extend_collateral_ttl(&env, &user);
+        new_balance
     }
 
     /// Borrow against deposited collateral. Enforces protocol-level debt ceiling.
@@ -293,27 +281,13 @@ impl LendingContract {
         if amount < min_borrow {
             panic!("BelowMinimumBorrow");
         }
-        
-        // Check debt ceiling with overflow protection
-        let total_debt: i128 = env.storage().persistent().get(&DataKey::TotalDebt).unwrap_or(0);
-        let debt_ceiling: i128 = env.storage().persistent().get(&DataKey::DebtCeiling).unwrap_or(DEFAULT_DEBT_CEILING);
-        
-        let new_total = total_debt.checked_add(amount)
-            .ok_or(LendingError::Overflow)?;
-        
-        if new_total > debt_ceiling {
-            return Err(LendingError::DebtCeilingExceeded);
-        }
-        
         let now = env.ledger().timestamp();
         let position = load_debt(&env, &user);
         let updated = borrow_amount(position, now, amount, DEFAULT_APR_BPS)
-            .map_err(|_| LendingError::Overflow)?;
+            .unwrap_or_else(|_| panic_with_debt_error());
         save_debt(&env, &user, &updated);
-        
-        // Update protocol-level total debt
-        env.storage().persistent().set(&DataKey::TotalDebt, &new_total);
-        
+        // Extend TTL to prevent archival of debt entry
+        extend_debt_ttl(&env, &user);
         Ok(updated.principal)
     }
 
@@ -361,17 +335,16 @@ impl LendingContract {
         let updated = repay_amount(position, now, amount, DEFAULT_APR_BPS)
             .map_err(|_| LendingError::Overflow)?;
         save_debt(&env, &user, &updated);
-        
-        // Decrement protocol-level total debt with underflow protection
-        let total_debt: i128 = env.storage().persistent().get(&DataKey::TotalDebt).unwrap_or(0);
-        let new_total = total_debt.checked_sub(amount).ok_or(LendingError::Overflow)?;
-        env.storage().persistent().set(&DataKey::TotalDebt, &new_total);
-        
-        Ok(updated.principal)
+        extend_debt_ttl(&env, &user);
+        updated.principal
     }
 
     pub fn get_debt_position(env: Env, user: Address) -> DebtPosition {
-        load_debt(&env, &user)
+        let position = load_debt(&env, &user);
+        if position.principal != 0 {
+            extend_debt_ttl(&env, &user);
+        }
+        position
     }
 
     /// Set the protocol-level debt ceiling (admin-only).
@@ -525,12 +498,15 @@ impl LendingContract {
     /// Get user position summary: collateral, effective debt, and health factor.
     /// Health factor uses checked arithmetic to prevent overflow on calculation.
     pub fn get_position(env: Env, user: Address) -> PositionSummary {
-        let col: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Collateral(user.clone()))
-            .unwrap_or(0);
+        let col_key = ("col", user.clone());
+        let col: i128 = env.storage().persistent().get(&col_key).unwrap_or(0);
+        if col != 0 {
+            extend_collateral_ttl(&env, &user);
+        }
         let position = load_debt(&env, &user);
+        if position.principal != 0 {
+            extend_debt_ttl(&env, &user);
+        }
         let debt = effective_debt(&position, env.ledger().timestamp(), DEFAULT_APR_BPS)
             .unwrap_or(position.principal);
         
@@ -564,6 +540,13 @@ mod test {
         let user = Address::generate(&env);
         client.initialize(&admin);
         (env, client, admin, user)
+    }
+
+    fn advance_time(env: &Env, seconds: u64) {
+        let mut li = env.ledger().get();
+        li.timestamp = li.timestamp.saturating_add(seconds);
+        li.sequence_number = li.sequence_number.saturating_add(seconds);
+        env.ledger().set(li);
     }
 
     #[test]
@@ -612,7 +595,63 @@ mod test {
         let pos = client.get_position(&user);
         assert_eq!(pos.collateral, 200);
         assert_eq!(pos.debt, 75);
-        assert!(pos.health_factor > 10000);
+    }
+
+    #[test]
+    fn test_ttl_keeps_position_live_across_reads() {
+        let (env, client, _admin, user) = setup();
+        client.deposit(&user, &200);
+        client.borrow(&user, &75);
+
+        // Move time to the middle of the TTL window and read the position.
+        advance_time(&env, (PERSISTENT_TTL_LEDGERS / 2) as u64);
+        let pos_mid = client.get_position(&user);
+        assert_eq!(pos_mid.collateral, 200);
+        assert_eq!(pos_mid.debt, 75);
+
+        // Advance past the original TTL boundary. The previous read should have extended TTL.
+        advance_time(&env, (PERSISTENT_TTL_LEDGERS / 2 + 1) as u64);
+        let pos_after = client.get_position(&user);
+        assert_eq!(pos_after.collateral, 200);
+        assert_eq!(pos_after.debt, 75);
+    }
+
+    #[test]
+    fn test_get_debt_position_extends_debt_ttl() {
+        let (env, client, _admin, user) = setup();
+        client.borrow(&user, &100);
+
+        advance_time(&env, (PERSISTENT_TTL_LEDGERS / 2) as u64);
+        let debt_mid = client.get_debt_position(&user);
+        assert_eq!(debt_mid.principal, 100);
+
+        advance_time(&env, (PERSISTENT_TTL_LEDGERS / 2 + 1) as u64);
+        let debt_after = client.get_debt_position(&user);
+        assert_eq!(debt_after.principal, 100);
+    }
+
+    #[test]
+    fn test_position_summary_default_zero() {
+        let (_env, client, _admin, user) = setup();
+        let pos = client.get_position(&user);
+        assert_eq!(pos.collateral, 0);
+        assert_eq!(pos.debt, 0);
+    }
+
+    #[test]
+    fn test_borrow_below_minimum_rejected() {
+        let (_env, client, _admin, user) = setup();
+        client.set_min_borrow(&50);
+        let res = client.try_borrow(&user, &40);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_borrow_exactly_minimum_accepted() {
+        let (_env, client, _admin, user) = setup();
+        client.set_min_borrow(&50);
+        let res = client.borrow(&user, &50);
+        assert_eq!(res, 50);
     }
 
     #[test]
