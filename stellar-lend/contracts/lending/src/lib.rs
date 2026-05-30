@@ -2,10 +2,12 @@
 
 mod debt;
 pub mod rounding_strategy;
-mod debt;
 
 #[cfg(test)]
 mod interest_drift_regression_test;
+
+#[cfg(test)]
+mod interest_ordering_time_test;
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Symbol};
 use debt::{borrow_amount, load_debt, save_debt, DebtPosition, DEFAULT_APR_BPS, repay_amount, effective_debt};
@@ -18,6 +20,9 @@ const PERSISTENT_TTL_LEDGERS: u32 = 1_000_000;
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DataKey {
+    Admin,
+    EmergencyState,
+    Guardian,
     Collateral(Address),
     Debt(Address),
     Balance(Address, Address),
@@ -55,16 +60,6 @@ fn with_reentrancy_lock<T>(env: &Env, f: impl FnOnce() -> T) -> T {
 }
 
 #[contracttype]
-pub enum DataKey {
-    Admin,
-    EmergencyState,
-    Guardian,
-    BorrowMinAmount,
-    FlashActive,
-    FlashFeeBps,
-}
-
-#[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmergencyState {
     Normal,
@@ -94,6 +89,7 @@ pub enum Error {
     BelowMinimumBorrow = 1008,
     NotInitialized = 1009,
     AlreadyInitialized = 1010,
+    PositionHealthy = 1011,
 }
 
 #[contracterror]
@@ -114,20 +110,8 @@ pub struct LendingContract;
 #[contractimpl]
 impl LendingContract {
     pub fn initialize(env: Env, admin: Address) {
-<<<<<<< HEAD
-        if env.storage().instance().has(&"admin") {
-            panic!("AlreadyInitialized");
-        }
-        env.storage().instance().set(&"admin", &admin);
-        // initialize emergency state to Normal
-        env.storage().instance().set(
-            &Symbol::new(&env, "EmergencyState"),
-            &EmergencyState::Normal,
-        );
-=======
         env.storage().instance().set(&DataKey::Admin, &admin);
         set_emergency_state_internal(&env, EmergencyState::Normal);
->>>>>>> f6bcee0 (feat: complete global emergency circuit breaker and unify instance storage hooks #831)
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -444,12 +428,8 @@ impl LendingContract {
             (initiator.clone(), asset.clone(), amount, fee, params).into_val(&env),
         );
 
-<<<<<<< HEAD
-        env.storage().instance().set(&"flash_active", &false);
-=======
         // clear reentrancy guard before checks to ensure state is readable
         env.storage().instance().set(&DataKey::FlashActive, &false);
->>>>>>> f6bcee0 (feat: complete global emergency circuit breaker and unify instance storage hooks #831)
 
         let final_tre: i128 = env.storage().persistent().get(&tre_key).unwrap_or(0);
         let required_balance = tre_bal.checked_add(fee)
@@ -490,8 +470,6 @@ impl LendingContract {
     }
 }
 
-<<<<<<< HEAD
-=======
 fn get_emergency_state(env: &Env) -> EmergencyState {
     env.storage()
         .instance()
@@ -523,7 +501,19 @@ fn panic_with_debt_error() -> ! {
     panic!("debt operation failed");
 }
 
->>>>>>> f6bcee0 (feat: complete global emergency circuit breaker and unify instance storage hooks #831)
+fn extend_collateral_ttl(env: &Env, user: &Address) {
+    let key = DataKey::Collateral(user.clone());
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL_LEDGERS, PERSISTENT_TTL_LEDGERS);
+}
+
+fn extend_debt_ttl(env: &Env, user: &Address) {
+    let key = DataKey::Debt(user.clone());
+    env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL_LEDGERS, PERSISTENT_TTL_LEDGERS);
+}
+
+const DEFAULT_DEPOSIT_CAP: i128 = i128::MAX;
+const REENTRANCY_LOCK_KEY: &str = "reentrancy_lock";
+
 #[cfg(test)]
 mod test {
     use super::*;
