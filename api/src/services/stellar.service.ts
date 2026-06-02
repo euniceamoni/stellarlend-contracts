@@ -259,6 +259,47 @@ export class StellarService {
     };
   }
 
+  async getProtocolMetrics(): Promise<{
+    total_supply: bigint;
+    total_borrow: bigint;
+    utilization_bps: bigint;
+    ledger: number;
+  }> {
+    try {
+      const contract = new Contract(this.contractId);
+      const operation = contract.call('get_protocol_metrics');
+
+      const tx = new TransactionBuilder(
+        new Account(this.contractId, '0'),
+        { fee: BASE_FEE, networkPassphrase: this.networkPassphrase }
+      )
+        .addOperation(operation)
+        .setTimeout(30)
+        .build();
+
+      const sim = await this.sorobanServer.simulateTransaction(tx);
+      if (!('result' in sim) || !sim.result) {
+        throw new InternalServerError('get_protocol_metrics simulation returned no result');
+      }
+
+      const fields = sim.result.retval.map().map((e: xdr.ScMapEntry) => ({
+        key: e.key().sym().toString(),
+        val: e.val(),
+      }));
+      const get = (name: string) => fields.find((f: { key: string }) => f.key === name)?.val;
+
+      return {
+        total_supply: BigInt(get('total_supply')?.i128()?.lo ?? 0),
+        total_borrow: BigInt(get('total_borrow')?.i128()?.lo ?? 0),
+        utilization_bps: BigInt(get('utilization_bps')?.i128()?.lo ?? 0),
+        ledger: get('ledger')?.u32() ?? 0,
+      };
+    } catch (error) {
+      logger.error('Failed to fetch protocol metrics:', error);
+      throw new InternalServerError('Failed to fetch protocol metrics');
+    }
+  }
+
   async healthCheck(): Promise<{ horizon: boolean; sorobanRpc: boolean }> {
     const results = {
       horizon: false,

@@ -102,6 +102,21 @@ pub struct PositionSummary {
     pub health_factor: i128,
 }
 
+/// Protocol-wide metrics snapshot returned by `get_protocol_metrics`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtocolMetrics {
+    /// Total collateral deposited across all users.
+    pub total_supply: i128,
+    /// Total debt (principal) outstanding across all users.
+    pub total_borrow: i128,
+    /// Utilization rate in basis points: `(total_borrow * 10_000) / total_supply`.
+    /// Returns 0 when `total_supply` is zero.
+    pub utilization_bps: i128,
+    /// Ledger sequence number at which this snapshot was taken.
+    pub ledger: u32,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -298,12 +313,18 @@ impl LendingContract {
         
         let now = env.ledger().timestamp();
         let position = load_debt(&env, &user);
+        let prev_principal = position.principal;
         let updated =
             borrow_amount(position, now, amount, DEFAULT_APR_BPS).map_err(|e| match e {
                 debt::DebtError::InvalidAmount => LendingError::InvalidAmount,
                 debt::DebtError::Overflow => LendingError::Overflow,
             })?;
         save_debt(&env, &user, &updated);
+        // Track protocol-level total debt
+        let total_debt: i128 = env.storage().persistent().get(&DataKey::TotalDebt).unwrap_or(0);
+        let delta = updated.principal.checked_sub(prev_principal).expect("borrow: delta overflow");
+        let new_total_debt = total_debt.checked_add(delta).expect("borrow: total_debt overflow");
+        env.storage().persistent().set(&DataKey::TotalDebt, &new_total_debt);
         Ok(updated.principal)
     }
 
@@ -385,12 +406,18 @@ impl LendingContract {
         user.require_auth();
         let now = env.ledger().timestamp();
         let position = load_debt(&env, &user);
+        let prev_principal = position.principal;
         let updated =
             repay_amount(position, now, amount, DEFAULT_APR_BPS).map_err(|e| match e {
                 debt::DebtError::InvalidAmount => LendingError::InvalidAmount,
                 debt::DebtError::Overflow => LendingError::Overflow,
             })?;
         save_debt(&env, &user, &updated);
+        // Track protocol-level total debt
+        let total_debt: i128 = env.storage().persistent().get(&DataKey::TotalDebt).unwrap_or(0);
+        let repaid = prev_principal.checked_sub(updated.principal).unwrap_or(0);
+        let new_total_debt = total_debt.saturating_sub(repaid);
+        env.storage().persistent().set(&DataKey::TotalDebt, &new_total_debt);
         extend_debt_ttl(&env, &user);
         Ok(updated.principal)
     }
@@ -555,6 +582,35 @@ impl LendingContract {
             collateral: col,
             debt,
             health_factor,
+        }
+    }
+
+    /// Returns a consistent protocol-wide snapshot: total supply, total borrow,
+    /// utilization in BPS, and the current ledger sequence number.
+    ///
+    /// `utilization_bps = (total_borrow * 10_000) / total_supply`.
+    /// Returns 0 when `total_supply` is 0 to avoid division-by-zero.
+    pub fn get_protocol_metrics(env: Env) -> ProtocolMetrics {
+        let total_supply: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalDeposits)
+            .unwrap_or(0);
+        let total_borrow: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalDebt)
+            .unwrap_or(0);
+        let utilization_bps = if total_supply > 0 {
+            total_borrow.saturating_mul(10_000) / total_supply
+        } else {
+            0
+        };
+        ProtocolMetrics {
+            total_supply,
+            total_borrow,
+            utilization_bps,
+            ledger: env.ledger().sequence(),
         }
     }
     env.storage().temporary().set(&reentrancy_lock_key, &true);
@@ -927,5 +983,83 @@ mod test {
         assert_eq!(repay_result, 40);
         let withdraw_result = client.withdraw(&user, &10);
         assert_eq!(withdraw_result, 190);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_protocol_metrics tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_protocol_metrics_initial_zeros() {
+        let (_env, client, _admin, _user) = setup();
+        let m = client.get_protocol_metrics();
+        assert_eq!(m.total_supply, 0);
+        assert_eq!(m.total_borrow, 0);
+        assert_eq!(m.utilization_bps, 0);
+    }
+
+    #[test]
+    fn test_protocol_metrics_after_deposit() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &1000);
+        let m = client.get_protocol_metrics();
+        assert_eq!(m.total_supply, 1000);
+        assert_eq!(m.total_borrow, 0);
+        assert_eq!(m.utilization_bps, 0);
+    }
+
+    #[test]
+    fn test_protocol_metrics_after_borrow() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &1000);
+        client.borrow(&user, &500);
+        let m = client.get_protocol_metrics();
+        assert_eq!(m.total_supply, 1000);
+        assert_eq!(m.total_borrow, 500);
+        assert_eq!(m.utilization_bps, 5000); // 50%
+    }
+
+    #[test]
+    fn test_protocol_metrics_after_repay() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &1000);
+        client.borrow(&user, &500);
+        client.repay(&user, &200);
+        let m = client.get_protocol_metrics();
+        assert_eq!(m.total_supply, 1000);
+        assert_eq!(m.total_borrow, 300);
+        assert_eq!(m.utilization_bps, 3000); // 30%
+    }
+
+    #[test]
+    fn test_protocol_metrics_interleaved_multiple_users() {
+        let (env, client, _admin, user1) = setup();
+        let user2 = Address::generate(&env);
+        client.deposit(&user1, &600);
+        client.deposit(&user2, &400);
+        client.borrow(&user1, &200);
+        client.borrow(&user2, &100);
+        let m = client.get_protocol_metrics();
+        assert_eq!(m.total_supply, 1000);
+        assert_eq!(m.total_borrow, 300);
+        assert_eq!(m.utilization_bps, 3000);
+    }
+
+    #[test]
+    fn test_protocol_metrics_full_repay_zeroes_borrow() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &1000);
+        client.borrow(&user, &400);
+        client.repay(&user, &400);
+        let m = client.get_protocol_metrics();
+        assert_eq!(m.total_borrow, 0);
+        assert_eq!(m.utilization_bps, 0);
+    }
+
+    #[test]
+    fn test_protocol_metrics_ledger_field_set() {
+        let (env, client, _admin, _user) = setup();
+        let m = client.get_protocol_metrics();
+        assert_eq!(m.ledger, env.ledger().sequence());
     }
 }
