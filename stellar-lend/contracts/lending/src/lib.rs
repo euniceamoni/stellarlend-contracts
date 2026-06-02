@@ -272,7 +272,7 @@ impl LendingContract {
         if amount < min_borrow {
             panic!("BelowMinimumBorrow");
         }
-        
+
         let now = env.ledger().timestamp();
         let position = load_debt(&env, &user);
         let updated =
