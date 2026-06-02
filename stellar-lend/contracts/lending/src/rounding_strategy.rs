@@ -235,4 +235,72 @@ mod tests {
             total_interest
         );
     }
+
+    #[test]
+    fn test_scaling_constants_are_canonical() {
+        assert_eq!(INTEREST_PRECISION, 1_000_000);
+        assert_eq!(BASIS_POINTS_SCALE, 10_000);
+        assert_eq!(SECONDS_PER_YEAR, 31_536_000);
+
+        let denominator = (SECONDS_PER_YEAR as i128) * BASIS_POINTS_SCALE;
+        assert_eq!(denominator, 315_360_000_000);
+    }
+
+    #[test]
+    fn test_bps_to_decimal_conversion() {
+        assert_eq!(500 * INTEREST_PRECISION / BASIS_POINTS_SCALE, 50_000);
+        assert_eq!(
+            10_000 * INTEREST_PRECISION / BASIS_POINTS_SCALE,
+            INTEREST_PRECISION
+        );
+        assert_eq!(1_000 * INTEREST_PRECISION / BASIS_POINTS_SCALE, 100_000);
+    }
+
+    #[test]
+    fn test_one_year_exact_no_remainder() {
+        let result =
+            calculate_interest_with_rounding(100, SECONDS_PER_YEAR, 500, RoundingMode::Bankers)
+                .unwrap();
+        assert_eq!(result.interest, 5);
+        assert_eq!(result.remainder, 0);
+    }
+
+    #[test]
+    fn test_one_second_small_fractional_interest() {
+        let result =
+            calculate_interest_with_rounding(100_000, 1, 500, RoundingMode::Bankers).unwrap();
+        assert_eq!(result.interest, 0);
+    }
+
+    #[test]
+    fn test_one_month_bankers_rounding() {
+        let result = calculate_interest_with_rounding(
+            1_000,
+            SECONDS_PER_YEAR / 12,
+            500,
+            RoundingMode::Bankers,
+        )
+        .unwrap();
+        assert_eq!(result.interest, 4);
+    }
+
+    #[test]
+    fn test_ceil_never_below_floor() {
+        let floor_result = calculate_interest_with_rounding(
+            1_000,
+            SECONDS_PER_YEAR / 12,
+            500,
+            RoundingMode::Floor,
+        )
+        .unwrap();
+        let ceil_result =
+            calculate_interest_with_rounding(1_000, SECONDS_PER_YEAR / 12, 500, RoundingMode::Ceil)
+                .unwrap();
+        assert!(
+            ceil_result.interest >= floor_result.interest,
+            "Ceil interest ({}) must be >= Floor interest ({})",
+            ceil_result.interest,
+            floor_result.interest
+        );
+    }
 }
