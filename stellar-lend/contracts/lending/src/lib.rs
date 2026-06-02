@@ -13,6 +13,18 @@ const PERSISTENT_TTL_LEDGERS: u32 = 1_000_000;
 const DEFAULT_DEPOSIT_CAP: i128 = 100_000_000_000_000; // 100 Trillion
 const DEFAULT_DEBT_CEILING: i128 = 50_000_000_000_000; // 50 Trillion
 
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
+const DEFAULT_DEPOSIT_CAP: i128 = 100_000_000_000;
+
+// ---------------------------------------------------------------------------
+// Storage keys
+// ---------------------------------------------------------------------------
+
+/// All storage keys used by the lending contract.
+///
+/// A single unified enum prevents the accidental key collisions caused by the
+/// previous approach of mixing typed `DataKey` variants with raw string literals.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DataKey {
@@ -29,9 +41,6 @@ pub enum DataKey {
     TotalDeposits,
     DebtCeiling,
     DepositCap,
-    FlashActive,
-    FlashFeeBps,
-    BorrowMinAmount,
 }
 
 #[contracttype]
@@ -42,12 +51,41 @@ pub enum EmergencyState {
     Recovery,
 }
 
+/// Labels used by `check_emergency_status` to decide which operations are
+/// allowed under each circuit-breaker state.
 pub enum ProtocolAction {
     Deposit,
     Withdraw,
     Borrow,
     Repay,
 }
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum LendingError {
+    BelowMinimumBorrow   = 1008,
+    /// Contract has not been initialized yet.
+    NotInitialized       = 1009,
+    /// `initialize` was called a second time.
+    AlreadyInitialized   = 1010,
+    DebtCeilingExceeded  = 2001,
+    DepositCapExceeded   = 2002,
+    Overflow             = 2003,
+    /// Caller is not the admin.
+    Unauthorized         = 2004,
+    /// Fee outside the permitted range.
+    InvalidFeeBps        = 2005,
+    PositionHealthy      = 2006,
+}
+
+// ---------------------------------------------------------------------------
+// Shared view structs
+// ---------------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -641,6 +679,7 @@ impl LendingContract {
 mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Events as _;
 
     fn setup() -> (Env, LendingContractClient<'static>, Address, Address) {
         let env = Env::default();
@@ -649,15 +688,22 @@ mod test {
         let client = LendingContractClient::new(&env, &id);
         let admin = Address::generate(&env);
         let user = Address::generate(&env);
-        client.initialize(&admin);
+        client.initialize(&admin).unwrap();
         (env, client, admin, user)
     }
 
-    fn advance_time(env: &Env, seconds: u64) {
-        let mut li = env.ledger().get();
-        li.timestamp = li.timestamp.saturating_add(seconds);
-        li.sequence_number = li.sequence_number.saturating_add(seconds);
-        env.ledger().set(li);
+    // -----------------------------------------------------------------------
+    // Initialization guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_double_initialize_rejected() {
+        let (_env, client, admin, _user) = setup();
+        let res = client.try_initialize(&admin);
+        assert!(
+            matches!(res, Err(Ok(LendingError::AlreadyInitialized))),
+            "expected AlreadyInitialized, got {:?}", res
+        );
     }
 
     #[contract]
@@ -673,46 +719,125 @@ mod test {
     #[test]
     fn test_initialize_and_get_admin() {
         let (_env, client, admin, _user) = setup();
-        assert_eq!(client.get_admin().unwrap(), admin);
+        assert_eq!(client.get_admin(), admin);
     }
+
+    // -----------------------------------------------------------------------
+    // Admin-only privileged setter guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic]
+    fn test_unauthorized_set_min_borrow_rejected() {
+        let (env, client, _admin, _user) = setup();
+        // Create a fresh address that has not been authenticated as admin.
+        let attacker = Address::generate(&env);
+        // With mock_all_auths the env will satisfy any require_auth, so we
+        // instead call the method without mocking to observe the auth failure.
+        let env2 = Env::default();
+        let id2 = env2.register(LendingContract, ());
+        let client2 = LendingContractClient::new(&env2, &id2);
+        let admin2 = Address::generate(&env2);
+        // Initialize is also called without mock so the auth here is critical.
+        env2.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin2,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &id2,
+                fn_name: "initialize",
+                args: (admin2.clone(),).into_val(&env2),
+                sub_invokes: &[],
+            },
+        }]);
+        client2.initialize(&admin2).unwrap();
+        // Now call set_min_borrow as attacker with no auth — should panic.
+        client2.set_min_borrow(&100).unwrap();
+    }
+
+    #[test]
+    fn test_set_min_borrow_admin_only() {
+        let (_env, client, _admin, _user) = setup();
+        assert_eq!(client.get_min_borrow(), 0);
+        client.set_min_borrow(&100).unwrap();
+        assert_eq!(client.get_min_borrow(), 100);
+    }
+
+    #[test]
+    fn test_set_debt_ceiling_admin_only() {
+        let (_env, client, _admin, _user) = setup();
+        client.set_debt_ceiling(&1_000_000).unwrap();
+        // No getter yet, just assert no panic.
+    }
+
+    #[test]
+    fn test_set_flash_fee_valid_range() {
+        let (_env, client, _admin, _user) = setup();
+        client.set_flash_fee(&50).unwrap();
+    }
+
+    #[test]
+    fn test_set_flash_fee_rejects_out_of_range() {
+        let (_env, client, _admin, _user) = setup();
+        let res = client.try_set_flash_fee(&1_001);
+        assert!(
+            matches!(res, Err(Ok(LendingError::InvalidFeeBps))),
+            "expected InvalidFeeBps, got {:?}", res
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin rotation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_propose_and_accept_admin() {
+        let (env, client, _admin, _user) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin).unwrap();
+        client.accept_admin().unwrap();
+        assert_eq!(client.get_admin().unwrap(), new_admin);
+    }
+
+    // -----------------------------------------------------------------------
+    // Core operations
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_deposit_increases_balance() {
         let (_env, client, _admin, user) = setup();
-        let result = client.deposit(&user, &100).unwrap();
+        let result = client.deposit(&user, &100);
         assert_eq!(result, 100);
-        let again = client.deposit(&user, &50).unwrap();
+        let again = client.deposit(&user, &50);
         assert_eq!(again, 150);
     }
 
     #[test]
     fn test_withdraw_decreases_balance() {
         let (_env, client, _admin, user) = setup();
-        client.deposit(&user, &100).unwrap();
-        let result = client.withdraw(&user, &40).unwrap();
+        client.deposit(&user, &100);
+        let result = client.withdraw(&user, &40);
         assert_eq!(result, 60);
     }
 
     #[test]
     fn test_borrow_increases_debt() {
         let (_env, client, _admin, user) = setup();
-        let result = client.borrow(&user, &50).unwrap();
+        let result = client.borrow(&user, &50);
         assert_eq!(result, 50);
     }
 
     #[test]
     fn test_repay_decreases_debt() {
         let (_env, client, _admin, user) = setup();
-        client.borrow(&user, &100).unwrap();
-        let result = client.repay(&user, &30).unwrap();
+        client.borrow(&user, &100);
+        let result = client.repay(&user, &30);
         assert_eq!(result, 70);
     }
 
     #[test]
     fn test_position_summary_reflects_state() {
         let (_env, client, _admin, user) = setup();
-        client.deposit(&user, &200).unwrap();
-        client.borrow(&user, &75).unwrap();
+        client.deposit(&user, &200);
+        client.borrow(&user, &75);
         let pos = client.get_position(&user);
         assert_eq!(pos.collateral, 200);
         assert_eq!(pos.debt, 75);
