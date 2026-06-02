@@ -2,6 +2,13 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HelloError {
+    InvalidAmount = 1,
+}
 
 
 
@@ -202,64 +209,56 @@ impl HelloContract {
         crate::admin::set_admin(&env, new_admin, Some(caller))
     }
 
-    /// Grant a role to an address (admin only).
-    pub fn grant_role(
-        env: Env,
-        caller: Address,
-        role: Symbol,
-        account: Address,
-    ) -> Result<(), crate::admin::AdminError> {
-        crate::admin::grant_role(&env, caller, role, account)
+    /// Increment the user's deposit balance.
+    pub fn deposit(env: Env, user: Address, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(env, HelloError::InvalidAmount);
+        }
+        user.require_auth();
+        let key = DataKey::Balance(user.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_bal = current + amount;
+        env.storage().persistent().set(&key, &new_bal);
+        new_bal
     }
 
-    /// Revoke a role from an address (admin only).
-    pub fn revoke_role(
-        env: Env,
-        caller: Address,
-        role: Symbol,
-        account: Address,
-    ) -> Result<(), crate::admin::AdminError> {
-        crate::admin::revoke_role(&env, caller, role, account)
+    /// Decrement the user's deposit balance.
+    pub fn withdraw(env: Env, user: Address, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(env, HelloError::InvalidAmount);
+        }
+        user.require_auth();
+        let key = DataKey::Balance(user.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_bal = current - amount;
+        env.storage().persistent().set(&key, &new_bal);
+        new_bal
     }
 
-    /// Deposit collateral into the protocol.
-    pub fn deposit_collateral(
-        env: Env,
-        user: Address,
-        asset: Option<Address>,
-        amount: i128,
-    ) -> Result<i128, crate::deposit::DepositError> {
-        crate::deposit::deposit_collateral(&env, user, asset, amount)
+    /// Borrow increases the user's debt.
+    pub fn borrow(env: Env, user: Address, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(env, HelloError::InvalidAmount);
+        }
+        user.require_auth();
+        let key = DataKey::Debt(user.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_debt = current + amount;
+        env.storage().persistent().set(&key, &new_debt);
+        new_debt
     }
 
-    /// Withdraw collateral from the protocol.
-    ///
-    /// Transfers `amount` of `asset` (or native XLM when `asset` is `None`)
-    /// back to `user`, subject to all safety and risk checks.
-    ///
-    /// # Authorization
-    /// Only the position owner (`user`) can call this function.
-    /// The transaction must be signed by `user`.
-    ///
-    /// # Errors
-    /// - If `amount` ≤ 0 → `InvalidAmount`
-    /// - If `user` did not authorize → `Unauthorized`
-    /// - If withdrawals are paused → `WithdrawPaused`
-    /// - If `user` balance < `amount` → `InsufficientCollateral`
-    /// - If withdrawal breaks minimum collateral ratio → `InsufficientCollateralRatio`
-    /// - If withdrawal would make position liquidatable → `Undercollateralized`
-    ///
-    /// # Security
-    /// - Enforces post-withdraw health checks against latest risk parameters.
-    /// - Prevents unsafe liquidation states — ANY unsafe withdrawal MUST fail.
-    /// - State updated before token transfer to guard against reentrancy.
-    pub fn withdraw_collateral(
-        env: Env,
-        user: Address,
-        asset: Option<Address>,
-        amount: i128,
-    ) -> Result<i128, crate::withdraw::WithdrawError> {
-        crate::withdraw::withdraw_collateral(&env, user, asset, amount)
+    /// Repay decreases the user's debt.
+    pub fn repay(env: Env, user: Address, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic_with_error!(env, HelloError::InvalidAmount);
+        }
+        user.require_auth();
+        let key = DataKey::Debt(user.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_debt = current - amount;
+        env.storage().persistent().set(&key, &new_debt);
+        new_debt
     }
 
     /// Set native asset address (admin only).
@@ -1339,6 +1338,100 @@ mod amm_pause_integration_test;
 
 // mod governance_test;
 
-// monitor_test references Monitor contract types not present in this crate
-// #[cfg(test)]
-// mod monitor_test;
+    #[test]
+    fn test_borrow_and_repay() {
+        let (_env, client, _admin, user) = setup();
+        assert_eq!(client.borrow(&user, &200), 200);
+        assert_eq!(client.repay(&user, &75), 125);
+    }
+
+    #[test]
+    fn test_get_state_default() {
+        let (_env, client, _admin, user) = setup();
+        let s = client.get_state(&user);
+        assert_eq!(s.balance, 0);
+        assert_eq!(s.debt, 0);
+    }
+
+    #[test]
+    fn test_get_state_after_actions() {
+        let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &500);
+        client.borrow(&user, &100);
+        let s = client.get_state(&user);
+        assert_eq!(s.balance, 500);
+        assert_eq!(s.debt, 100);
+    }
+
+    #[test]
+    fn test_deposit_rejects_zero_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.deposit(&user, &0);
+        }));
+        assert!(result.is_err(), "deposit should panic with zero amount");
+    }
+
+    #[test]
+    fn test_deposit_rejects_negative_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.deposit(&user, &-100);
+        }));
+        assert!(result.is_err(), "deposit should panic with negative amount");
+    }
+
+    #[test]
+    fn test_withdraw_rejects_zero_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.withdraw(&user, &0);
+        }));
+        assert!(result.is_err(), "withdraw should panic with zero amount");
+    }
+
+    #[test]
+    fn test_withdraw_rejects_negative_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.withdraw(&user, &-100);
+        }));
+        assert!(result.is_err(), "withdraw should panic with negative amount");
+    }
+
+    #[test]
+    fn test_borrow_rejects_zero_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.borrow(&user, &0);
+        }));
+        assert!(result.is_err(), "borrow should panic with zero amount");
+    }
+
+    #[test]
+    fn test_borrow_rejects_negative_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.borrow(&user, &-100);
+        }));
+        assert!(result.is_err(), "borrow should panic with negative amount");
+    }
+
+    #[test]
+    fn test_repay_rejects_zero_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.repay(&user, &0);
+        }));
+        assert!(result.is_err(), "repay should panic with zero amount");
+    }
+
+    #[test]
+    fn test_repay_rejects_negative_amount() {
+        let (env, client, _admin, user) = setup();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.repay(&user, &-100);
+        }));
+        assert!(result.is_err(), "repay should panic with negative amount");
+    }
+}
