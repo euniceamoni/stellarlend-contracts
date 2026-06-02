@@ -462,3 +462,62 @@ contract.health_check()
 Effective oracle configuration management is critical for the security and reliability of the StellarLend protocol. This guide provides the procedures and considerations necessary for maintaining a robust oracle system while ensuring proper role separation and security controls.
 
 Regular review of configurations, continuous monitoring, and adherence to security best practices are essential for maintaining system integrity and protecting user assets.
+
+
+
+## AMM TWAP Fallback (Issue #868)
+
+### Overview
+
+When the primary oracle is stale or unavailable, the lending contract automatically
+falls back to a Time-Weighted Average Price (TWAP) derived from the on-chain AMM pool.
+
+### Fallback chain
+
+Call external oracle → accept if age ≤ max_staleness_seconds
+If stale/absent    → emit OrcStale event, use AMM TWAP
+If TWAP has no history → panic (fail-safe, never price on nothing)
+
+
+### TWAP formula
+
+For a pool with reserves `(R₀, R₁)`, after `Δt` seconds:
+price0_cumulative += (R₁ / R₀) × 10¹⁸ × Δt
+TWAP over window W = Δprice0_cumulative / W
+
+Divide the result by `10¹⁸` to get the human-readable price.
+
+### Configuration
+
+The `twap_window_secs` field in `OracleConfig` controls the fallback look-back window.
+
+| Window       | Seconds | Use case                        |
+|--------------|---------|---------------------------------|
+| Minimum      | 25 s    | Testing / low-value positions   |
+| Recommended  | 150 s   | Standard liquidation checks     |
+| High-value   | 1500 s  | Large / high-value positions    |
+
+### Manipulation resistance
+
+A single flash-loan or block-level swap cannot meaningfully move a 150 s+ TWAP because
+the manipulated price only affects one slot out of many. The attacker must hold the
+position open across multiple ledger closes, bearing full impermanent loss and
+liquidation risk throughout.
+
+### Events emitted
+
+| Event       | Trigger                                  |
+|-------------|------------------------------------------|
+| `OrcStale`  | Primary oracle age > max_staleness_seconds |
+| `OrcFallbk` | TWAP fallback was used for pricing       |
+
+Monitor both events to detect oracle health issues in production.
+
+### New files added
+
+| File                   | Location                                      |
+|------------------------|-----------------------------------------------|
+| `amm_twap.rs`          | `stellar-lend/contracts/hello-world/src/`     |
+| `twap_tests.rs`        | `stellar-lend/contracts/hello-world/src/`     |
+| Modified: `amm.rs`     | `stellar-lend/contracts/hello-world/src/`     |
+| Modified: `oracle.rs`  | `stellar-lend/contracts/hello-world/src/`     |
