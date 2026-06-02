@@ -74,18 +74,18 @@ pub enum ProtocolAction {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum LendingError {
-    InvalidAmount       = 1004,
-    BelowMinimumBorrow  = 1008,
-    NotInitialized      = 1009,
-    AlreadyInitialized  = 1010,
-    PositionHealthy     = 1011,
+    InvalidAmount = 1004,
+    BelowMinimumBorrow = 1008,
+    NotInitialized = 1009,
+    AlreadyInitialized = 1010,
+    PositionHealthy = 1011,
     DebtCeilingExceeded = 2001,
-    DepositCapExceeded  = 2002,
-    Overflow            = 2003,
+    DepositCapExceeded = 2002,
+    Overflow = 2003,
     /// Caller is not the admin.
-    Unauthorized        = 2004,
+    Unauthorized = 2004,
     /// Fee outside the permitted range.
-    InvalidFeeBps       = 2005,
+    InvalidFeeBps = 2005,
 }
 
 #[contracterror]
@@ -249,9 +249,12 @@ impl LendingContract {
             .persistent()
             .get(&DataKey::TotalDeposits)
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalDeposits, &total_deposits.checked_sub(amount).expect("withdraw: total deposits underflow"));
+        env.storage().persistent().set(
+            &DataKey::TotalDeposits,
+            &total_deposits
+                .checked_sub(amount)
+                .expect("withdraw: total deposits underflow"),
+        );
         extend_collateral_ttl(&env, &user);
         Ok(new_balance)
     }
@@ -524,7 +527,18 @@ impl LendingContract {
 
         let method = Symbol::new(&env, "on_flash_loan");
         // Call contract - if it panics, propagate
-        env.invoke_contract::<Val>(&receiver, &method, soroban_sdk::vec![&env, initiator.into_val(&env), asset.into_val(&env), amount.into_val(&env), fee.into_val(&env), params.into_val(&env)]);
+        env.invoke_contract::<Val>(
+            &receiver,
+            &method,
+            soroban_sdk::vec![
+                &env,
+                initiator.into_val(&env),
+                asset.into_val(&env),
+                amount.into_val(&env),
+                fee.into_val(&env),
+                params.into_val(&env)
+            ],
+        );
 
         // clear reentrancy guard before checks to ensure state is readable
         env.storage().instance().set(&DataKey::FlashActive, &false);
@@ -626,7 +640,9 @@ fn extend_collateral_ttl(env: &Env, user: &Address) {
     let extend_to = env.storage().max_ttl().min(PERSISTENT_TTL_LEDGERS);
     let threshold = extend_to / 2 + 1;
     if env.storage().persistent().has(&key) {
-        env.storage().persistent().extend_ttl(&key, threshold, extend_to);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
     }
 }
 
@@ -635,7 +651,9 @@ fn extend_debt_ttl(env: &Env, user: &Address) {
     let extend_to = env.storage().max_ttl().min(PERSISTENT_TTL_LEDGERS);
     let threshold = extend_to / 2 + 1;
     if env.storage().persistent().has(&key) {
-        env.storage().persistent().extend_ttl(&key, threshold, extend_to);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
     }
 }
 
@@ -673,7 +691,12 @@ mod test {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
 
-    fn setup() -> (Env, LendingContractClient<'static>, soroban_sdk::Address, soroban_sdk::Address) {
+    fn setup() -> (
+        Env,
+        LendingContractClient<'static>,
+        soroban_sdk::Address,
+        soroban_sdk::Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let id = env.register(LendingContract, ());
@@ -756,7 +779,8 @@ mod test {
         let res = client.try_set_flash_fee(&1_001);
         assert!(
             matches!(res, Err(Ok(LendingError::InvalidFeeBps))),
-            "expected InvalidFeeBps, got {:?}", res
+            "expected InvalidFeeBps, got {:?}",
+            res
         );
     }
 
