@@ -181,7 +181,7 @@ mod test {
                 let rate_a = compute_borrow_rate(util_a, &p);
                 let rate_b = compute_borrow_rate(util_b, &p);
                 if util_a <= util_b {
-                    prop_assert!(
+                    assert!(
                         rate_a <= rate_b,
                         "rate decreased: util {} -> {} gave rate {} -> {}",
                         util_a, util_b, rate_a, rate_b
@@ -199,13 +199,13 @@ mod test {
             ) {
                 let p = RateParams::default();
                 let rate = compute_borrow_rate(util, &p);
-                prop_assert!(
+                assert!(
                     rate >= p.rate_floor_bps,
                     "rate {} below floor {}",
                     rate,
                     p.rate_floor_bps
                 );
-                prop_assert!(
+                assert!(
                     rate <= p.rate_ceiling_bps,
                     "rate {} above ceiling {}",
                     rate,
@@ -223,7 +223,7 @@ mod test {
             ) {
                 let p = RateParams::default();
                 let rate = compute_borrow_rate(util, &p);
-                prop_assert!(rate >= 0, "negative rate {}", rate);
+                assert!(rate >= 0, "negative rate {}", rate);
             }
         }
 
@@ -237,7 +237,7 @@ mod test {
                 let p = RateParams::default();
                 let rate_1 = compute_borrow_rate(util, &p);
                 let rate_2 = compute_borrow_rate(util, &p);
-                prop_assert_eq!(rate_1, rate_2, "non-deterministic rate");
+                assert_eq!(rate_1, rate_2, "non-deterministic rate");
             }
         }
     }
