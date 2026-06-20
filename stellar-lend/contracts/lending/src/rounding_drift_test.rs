@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod rounding_drift_tests {
+    use crate::debt::accrue_interest;
     use crate::rounding_strategy::{
         calculate_interest_with_rounding, InterestCalcResult, RoundingMode, BASIS_POINTS_SCALE,
         INTEREST_PRECISION, SECONDS_PER_YEAR,
@@ -127,6 +128,29 @@ mod rounding_drift_tests {
 
         assert_eq!(rounded_micro_units(&even_tie), 2);
         assert_eq!(rounded_micro_units(&odd_tie), 8);
+    }
+
+    /// Fails if the production debt accrual path stops using Bankers rounding.
+    #[test]
+    fn test_debt_accrual_uses_bankers_rounding_for_exact_half_case() {
+        let principal = 9_275_289_480i128;
+        let elapsed_seconds = 1u64;
+        let rate_bps = 34i128;
+
+        let truncate = calculate_interest_with_rounding(
+            principal,
+            elapsed_seconds,
+            rate_bps,
+            RoundingMode::Truncate,
+        )
+        .unwrap();
+
+        assert_eq!(truncate.interest, 0);
+        assert_eq!(
+            exact_micro_numerator(principal, elapsed_seconds, rate_bps) % denominator(),
+            denominator() / 2
+        );
+        assert_eq!(accrue_interest(principal, elapsed_seconds, rate_bps), Ok(1));
     }
 
     /// Compares cumulative Bankers rounding against an aggregate exact reference.
