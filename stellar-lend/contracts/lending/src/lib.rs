@@ -25,6 +25,8 @@ mod health_factor_edge_test;
 #[cfg(test)]
 mod interest_drift_regression_test;
 #[cfg(test)]
+mod borrow_health_factor_test;
+#[cfg(test)]
 mod rounding_drift_test;
 #[cfg(test)]
 mod rate_cache_test;
@@ -42,7 +44,7 @@ use soroban_sdk::{
 const PERSISTENT_TTL_LEDGERS: u32 = 1_000_000;
 const DEFAULT_DEPOSIT_CAP: i128 = 1_000_000_000_000;
 #[allow(dead_code)]
-const HEALTH_FACTOR_SCALE: i128 = 10_000;
+pub(crate) const HEALTH_FACTOR_SCALE: i128 = 10_000;
 const HEALTH_FACTOR_NO_DEBT: i128 = 100_000_000;
 pub const LIQUIDATION_THRESHOLD_BPS: i128 = 8000;
 const DEFAULT_ORACLE_MAX_AGE_SECS: u64 = 3600;
@@ -527,6 +529,11 @@ impl LendingContract {
     }
 
     /// Borrow assets after pause and emergency gates pass.
+    ///
+    /// Accrues interest on the existing position, increases principal by `amount`,
+    /// and rejects the borrow when the post-borrow health factor would fall below
+    /// 1.0 (`HEALTH_FACTOR_SCALE`) or when protocol `TotalDebt` would exceed
+    /// `DataKey::DebtCeiling`.
     pub fn borrow(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
         check_pause_status(&env, ProtocolAction::Borrow);
         check_emergency_status(&env, ProtocolAction::Borrow);
@@ -547,8 +554,7 @@ impl LendingContract {
             debt::DebtError::InvalidAmount => LendingError::InvalidAmount,
             debt::DebtError::Overflow => LendingError::Overflow,
         })?;
-        save_debt(&env, &user, &updated);
-        // Track protocol-level total debt
+
         let total_debt: i128 = env
             .storage()
             .persistent()
@@ -557,10 +563,14 @@ impl LendingContract {
         let delta = updated
             .principal
             .checked_sub(prev_principal)
-            .expect("borrow: delta overflow");
+            .ok_or(LendingError::Overflow)?;
         let new_total_debt = total_debt
             .checked_add(delta)
-            .expect("borrow: total_debt overflow");
+            .ok_or(LendingError::Overflow)?;
+
+        assert_borrow_solvent(&env, &user, &updated, new_total_debt)?;
+
+        save_debt(&env, &user, &updated);
         env.storage()
             .persistent()
             .set(&DataKey::TotalDebt, &new_total_debt);
@@ -1167,6 +1177,57 @@ fn load_rate_snapshot(env: &Env) -> debt::RateSnapshot {
     debt::load_rate_snapshot(env)
 }
 
+/// Reject a prospective borrow that would leave the user undercollateralized or
+/// push protocol `TotalDebt` past the configured ceiling.
+///
+/// Health factor uses effective debt after accrual:
+/// `(collateral * LIQUIDATION_THRESHOLD_BPS) / new_debt >= HEALTH_FACTOR_SCALE`.
+/// The overflow-safe equivalent is
+/// `collateral * LIQUIDATION_THRESHOLD_BPS >= HEALTH_FACTOR_SCALE * new_debt`.
+///
+/// # Worked example
+/// With 100 collateral, 80% liquidation threshold, and 80 debt:
+/// `100 * 8000 = 800_000 >= 10_000 * 80 = 800_000` — exactly at HF 1.0.
+/// A borrow to 81 debt would fail because `800_000 < 810_000`.
+fn assert_borrow_solvent(
+    env: &Env,
+    user: &Address,
+    updated_position: &DebtPosition,
+    new_total_debt: i128,
+) -> Result<(), LendingError> {
+    let col_key = DataKey::Collateral(user.clone());
+    let collateral: i128 = env.storage().persistent().get(&col_key).unwrap_or(0);
+
+    let now = env.ledger().timestamp();
+    let rate = current_borrow_rate(env);
+    let new_debt = effective_debt(updated_position, now, rate).map_err(|_| LendingError::Overflow)?;
+
+    if new_debt > 0 {
+        let weighted_collateral = collateral
+            .checked_mul(LIQUIDATION_THRESHOLD_BPS)
+            .ok_or(LendingError::Overflow)?;
+        let required_collateral = HEALTH_FACTOR_SCALE
+            .checked_mul(new_debt)
+            .ok_or(LendingError::Overflow)?;
+
+        if weighted_collateral < required_collateral {
+            return Err(LendingError::InsufficientCollateral);
+        }
+    }
+
+    if let Some(ceiling) = env
+        .storage()
+        .instance()
+        .get::<DataKey, i128>(&DataKey::DebtCeiling)
+    {
+        if new_total_debt > ceiling {
+            return Err(LendingError::DebtCeilingExceeded);
+        }
+    }
+
+    Ok(())
+}
+
 fn current_borrow_rate(env: &Env) -> i128 {
     cached_borrow_rate(env)
 }
@@ -1524,12 +1585,14 @@ mod test {
     #[test]
     fn test_borrow_increases_debt() {
         let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &125);
         assert_eq!(client.borrow(&user, &50), 50);
     }
 
     #[test]
     fn test_repay_decreases_debt() {
         let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &250);
         client.borrow(&user, &100);
         assert_eq!(client.repay(&user, &30), 70);
     }
@@ -1564,6 +1627,7 @@ mod test {
     #[test]
     fn test_get_debt_position_extends_debt_ttl() {
         let (env, client, _admin, user) = setup();
+        client.deposit(&user, &250);
         client.borrow(&user, &100);
 
         advance_time(&env, (PERSISTENT_TTL_LEDGERS / 2) as u64);
@@ -1595,6 +1659,7 @@ mod test {
     fn test_borrow_exactly_minimum_accepted() {
         let (_env, client, _admin, user) = setup();
         client.set_min_borrow(&50);
+        client.deposit(&user, &125);
         let res = client.borrow(&user, &50);
         assert_eq!(res, 50);
     }
@@ -1629,12 +1694,12 @@ mod test {
     }
 
     #[test]
-    fn test_health_factor_unhealthy() {
+    fn test_health_factor_unhealthy_borrow_rejected() {
         let (_env, client, _admin, user) = setup();
         client.deposit(&user, &100);
-        client.borrow(&user, &200);
-        let hf = client.get_health_factor(&user);
-        assert!(hf < HEALTH_FACTOR_SCALE);
+        let res = client.try_borrow(&user, &200);
+        assert!(matches!(res, Err(Ok(LendingError::InsufficientCollateral))));
+        assert_eq!(client.get_health_factor(&user), HEALTH_FACTOR_NO_DEBT);
     }
 
     #[test]
@@ -1725,6 +1790,7 @@ mod test {
     #[should_panic(expected = "OperationDisabledDuringShutdown")]
     fn test_shutdown_blocks_repay() {
         let (_env, client, _admin, user) = setup();
+        client.deposit(&user, &250);
         client.borrow(&user, &100);
         client.set_emergency_state(&EmergencyState::Shutdown);
         client.repay(&user, &10);
