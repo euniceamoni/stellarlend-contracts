@@ -21,6 +21,8 @@ mod health_factor_edge_test;
 mod interest_drift_regression_test;
 #[cfg(test)]
 mod rounding_drift_test;
+#[cfg(test)]
+mod liquidate_event_test;
 
 use debt::{
     borrow_amount, effective_debt, load_debt, repay_amount, save_debt, settle_accrual,
@@ -41,6 +43,7 @@ pub const LIQUIDATION_THRESHOLD_BPS: i128 = 8000;
 const DEFAULT_ORACLE_MAX_AGE_SECS: u64 = 3600;
 const ORACLE_SIGNATURE_DOMAIN: &[u8] = b"StellarLendOracle";
 const BPS_DENOM: i128 = 10_000;
+const SCHEMA_VERSION_V1: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +82,18 @@ pub struct PauseStateChangedEvent {
     pub operation: PauseType,
     pub old_state: PauseState,
     pub new_state: PauseState,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiquidationEventV1 {
+    pub schema_version: u32,
+    pub liquidator: Address,
+    pub borrower: Address,
+    pub repaid: i128,
+    pub seized: i128,
+    pub health_factor_before: i128,
+    pub shortfall: i128,
 }
 
 #[contracttype]
@@ -552,6 +567,19 @@ impl LendingContract {
         };
         save_debt(&env, &borrower, &updated_position);
         env.storage().persistent().set(&col_key, &new_col);
+
+        let shortfall = seized_collateral - final_seized;
+
+        LiquidationEventV1 {
+            schema_version: SCHEMA_VERSION_V1,
+            liquidator: liquidator.clone(),
+            borrower: borrower.clone(),
+            repaid: actual_repay,
+            seized: final_seized,
+            health_factor_before: hf,
+            shortfall,
+        }
+        .publish(&env);
 
         Ok(actual_repay)
     }
