@@ -6,6 +6,8 @@ pub mod rate_model;
 pub mod rounding_strategy;
 
 #[cfg(test)]
+mod admin_handover_test;
+#[cfg(test)]
 mod admin_setters_dedupe_test;
 #[cfg(test)]
 mod deposit_accounting_test;
@@ -122,6 +124,7 @@ pub enum LendingError {
     InvalidAmount = 1001,
     Overflow = 1002,
     Unauthorized = 1003,
+    PendingAdminNotSet = 1004,
     BelowMinimumBorrow = 1008,
     NotInitialized = 1009,
     AlreadyInitialized = 1010,
@@ -255,6 +258,8 @@ impl LendingContract {
     }
 
     /// Propose a new admin (current admin only).
+    ///
+    /// Replaces any existing pending admin proposal.
     pub fn propose_admin(env: Env, new_admin: Address) {
         let current_admin = Self::get_admin(env.clone());
         current_admin.require_auth();
@@ -263,17 +268,23 @@ impl LendingContract {
             .set(&DataKey::PendingAdmin, &new_admin);
     }
 
-    pub fn accept_admin(env: Env) {
+    /// Accept the currently pending admin handover.
+    ///
+    /// Returns `PendingAdminNotSet` if no admin has been proposed yet. On
+    /// success, the pending admin must sign the call, the admin address is
+    /// updated, and `PendingAdmin` is cleared.
+    pub fn accept_admin(env: Env) -> Result<(), LendingError> {
         let pending_admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
-            .expect("no pending admin");
+            .ok_or(LendingError::PendingAdminNotSet)?;
         pending_admin.require_auth();
         env.storage()
             .instance()
             .set(&DataKey::Admin, &pending_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(())
     }
 
     pub fn set_guardian(env: Env, guardian: Address) {
@@ -1192,23 +1203,6 @@ mod test {
             res
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Admin rotation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_propose_and_accept_admin() {
-        let (env, client, _admin, _user) = setup();
-        let new_admin = Address::generate(&env);
-        client.propose_admin(&new_admin);
-        client.accept_admin();
-        assert_eq!(client.get_admin(), new_admin);
-    }
-
-    // -----------------------------------------------------------------------
-    // Core operations
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_set_price_with_valid_signature_succeeds() {
