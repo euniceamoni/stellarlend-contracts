@@ -312,7 +312,7 @@ impl LendingContract {
 
         let expires_at_ledger = env.ledger().sequence().saturating_add(ttl_ledgers);
 
-        let key = DataKey::PauseState(pause_type.clone());
+        let key = DataKey::PauseState(pause_type);
         let old_state = env.storage().instance().get(&key).unwrap_or(PauseState {
             paused: false,
             expires_at_ledger: 0,
