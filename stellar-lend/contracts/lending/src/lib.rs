@@ -53,6 +53,8 @@ mod oracle_payload_binding_test;
 mod liquidate_checked_sub_test;
 #[cfg(test)]
 mod self_liquidation_test;
+#[cfg(test)]
+mod property_invariants_test;
 
 use debt::{
     borrow_amount, cached_borrow_rate, effective_debt, load_debt, repay_amount, save_debt,
