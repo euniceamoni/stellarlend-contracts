@@ -7,6 +7,7 @@ fn test_error_code_stability_and_uniqueness() {
         (LendingError::InvalidAmount, 1001),
         (LendingError::Overflow, 1002),
         (LendingError::Unauthorized, 1003),
+        (LendingError::PendingAdminNotSet, 1004),
         (LendingError::BelowMinimumBorrow, 1008),
         (LendingError::NotInitialized, 1009),
         (LendingError::AlreadyInitialized, 1010),
