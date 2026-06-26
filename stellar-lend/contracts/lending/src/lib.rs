@@ -43,6 +43,8 @@ mod rate_cache_test;
 mod oracle_payload_binding_test;
 #[cfg(test)]
 mod liquidate_checked_sub_test;
+#[cfg(test)]
+mod self_liquidation_test;
 
 use debt::{
     borrow_amount, cached_borrow_rate, effective_debt, load_debt, repay_amount, save_debt,
@@ -168,6 +170,8 @@ pub enum LendingError {
     DepositCapExceeded = 2002,
     InvalidFeeBps = 2005,
     InsufficientCollateral = 2007,
+    /// Rejects a liquidation where the liquidator and borrower are the same address.
+    SelfLiquidation = 2008,
     InvalidOracleSignature = 5001,
     StaleOracleTimestamp = 5002,
     OraclePubkeyNotSet = 5003,
@@ -633,6 +637,10 @@ impl LendingContract {
         Ok(updated.principal)
     }
 
+    /// Liquidate an under-collateralized borrower position.
+    ///
+    /// Self-liquidations are rejected immediately so a borrower cannot profit
+    /// from the liquidation incentive on their own collateral.
     pub fn liquidate(
         env: Env,
         liquidator: Address,
@@ -640,6 +648,10 @@ impl LendingContract {
         amount: i128,
     ) -> Result<i128, LendingError> {
         liquidator.require_auth();
+        if liquidator == borrower {
+            return Err(LendingError::SelfLiquidation);
+        }
+
         let col_key = DataKey::Collateral(borrower.clone());
 
         let collateral: i128 = env.storage().persistent().get(&col_key).unwrap_or(0);
