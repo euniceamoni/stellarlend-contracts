@@ -6,6 +6,7 @@ members = [
   "contracts/lending",
   "contracts/multisig",
   "contracts/vesting",
+  "cross_asset_test",
 ]
 
 [workspace.dependencies]
