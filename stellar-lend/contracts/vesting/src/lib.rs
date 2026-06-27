@@ -229,4 +229,7 @@ mod tests {
 }
 
 #[cfg(test)]
+mod vested_at_proptest;
+
+#[cfg(test)]
 mod vesting_views_test;

@@ -1887,6 +1887,9 @@ dependencies = [
 [[package]]
 name = "stellarlend-vesting"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "strsim"
