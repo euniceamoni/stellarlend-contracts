@@ -10,27 +10,27 @@ pub mod upgrade;
 #[cfg(test)]
 mod admin_handover_test;
 #[cfg(test)]
-mod upgrade_governance_test;
-#[cfg(test)]
 mod admin_setters_dedupe_test;
 #[cfg(test)]
-mod cross_asset_test;
+mod bad_debt_ledger_test;
 #[cfg(test)]
 mod bad_debt_write_off_test;
+#[cfg(test)]
+mod borrow_health_factor_test;
+#[cfg(test)]
+mod cross_asset_test;
 #[cfg(test)]
 mod deposit_accounting_test;
 #[cfg(test)]
 mod deposit_cap_race_test;
-#[cfg(test)]
-mod repay_overpay_test;
-#[cfg(test)]
-mod liquidate_transfer_test;
 #[cfg(test)]
 mod emergency_state_matrix_test;
 #[cfg(test)]
 mod error_codes_test;
 #[cfg(test)]
 mod flash_pause_gating_test;
+#[cfg(test)]
+mod flash_utilization_test;
 #[cfg(test)]
 mod granular_pause_ops_test;
 #[cfg(test)]
@@ -40,41 +40,41 @@ mod liquidation_sequence_invariant_test;
 #[cfg(test)]
 mod interest_drift_regression_test;
 #[cfg(test)]
-mod borrow_health_factor_test;
-#[cfg(test)]
-mod liquidate_close_factor_test;
-#[cfg(test)]
-mod oracle_staleness_test;
-#[cfg(test)]
-mod liquidate_rounding_test;
-#[cfg(test)]
-mod flash_utilization_test;
-#[cfg(test)]
-mod liquidation_bonus_proptest;
-#[cfg(test)]
 mod isolation_mode_test;
-#[cfg(test)]
-mod rounding_drift_test;
-#[cfg(test)]
-mod rate_cache_test;
-#[cfg(test)]
-mod oracle_payload_binding_test;
 #[cfg(test)]
 mod liquidate_checked_sub_test;
 #[cfg(test)]
 mod liquidate_accrual_test;
 #[cfg(test)]
-mod self_liquidation_test;
-#[cfg(test)]
-mod property_invariants_test;
+mod liquidate_close_factor_test;
 #[cfg(test)]
 mod liquidate_event_test;
 #[cfg(test)]
-mod bad_debt_ledger_test;
+mod liquidate_rounding_test;
 #[cfg(test)]
-mod supply_rate_split_test;
+mod liquidate_transfer_test;
+#[cfg(test)]
+mod liquidation_bonus_proptest;
+#[cfg(test)]
+mod oracle_payload_binding_test;
+#[cfg(test)]
+mod oracle_staleness_test;
+#[cfg(test)]
+mod position_summary_bench_test;
+#[cfg(test)]
+mod property_invariants_test;
+#[cfg(test)]
+mod rate_cache_test;
 #[cfg(test)]
 mod repay_debt_floor_test;
+#[cfg(test)]
+mod repay_overpay_test;
+#[cfg(test)]
+mod rounding_drift_test;
+#[cfg(test)]
+mod self_liquidation_test;
+#[cfg(test)]
+mod supply_rate_split_test;
 #[cfg(test)]
 mod liquidate_perf_test;
 
@@ -82,12 +82,12 @@ use debt::{
     borrow_amount, cached_borrow_rate, effective_debt, load_debt, repay_amount, save_debt,
     settle_accrual, DebtPosition, DEFAULT_APR_BPS,
 };
+use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, IntoVal, Symbol, Val, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
+    Env, IntoVal, Symbol, Val, Vec,
 };
-use soroban_sdk::token::Client as TokenClient;
 
 const PERSISTENT_TTL_LEDGERS: u32 = 1_000_000;
 const DEFAULT_DEPOSIT_CAP: i128 = 1_000_000_000_000;
@@ -418,7 +418,10 @@ impl LendingContract {
 
     /// Returns the accumulated protocol bad debt.
     pub fn get_bad_debt(env: Env) -> i128 {
-        env.storage().persistent().get(&DataKey::BadDebt).unwrap_or(0i128)
+        env.storage()
+            .persistent()
+            .get(&DataKey::BadDebt)
+            .unwrap_or(0i128)
     }
 
     /// Set the configured oracle pubkey used to verify signed price updates.
@@ -451,8 +454,8 @@ impl LendingContract {
             return Err(LendingError::InvalidAmount);
         }
         // Retrieve optional bounds
-        let min_opt: Option<i128> = env.storage().persistent().get(&DataKey::PriceMin(asset));
-        let max_opt: Option<i128> = env.storage().persistent().get(&DataKey::PriceMax(asset));
+        let min_opt: Option<i128> = env.storage().persistent().get(&DataKey::PriceMin(asset.clone()));
+        let max_opt: Option<i128> = env.storage().persistent().get(&DataKey::PriceMax(asset.clone()));
         if let Some(min) = min_opt {
             if price < min {
                 return Err(LendingError::PriceOutOfBounds);
@@ -544,7 +547,7 @@ impl LendingContract {
     /// The requested amount must not exceed `max_flash_bps × available_liquidity / 10000`.
     pub fn set_max_flash_bps(env: Env, max_flash_bps: i128) -> Result<(), LendingError> {
         assert_admin(&env);
-        if max_flash_bps < 0 || max_flash_bps > BPS_DENOM {
+        if !(0..=BPS_DENOM).contains(&max_flash_bps) {
             return Err(LendingError::InvalidFlashUtilizationBps);
         }
         env.storage()
@@ -565,15 +568,15 @@ impl LendingContract {
         if min_price <= 0 || max_price <= 0 || min_price >= max_price {
             return Err(LendingError::InvalidAmount);
         }
-        env.storage().persistent().set(&DataKey::PriceMin(asset), &min_price);
-        env.storage().persistent().set(&DataKey::PriceMax(asset), &max_price);
+        env.storage().persistent().set(&DataKey::PriceMin(asset.clone()), &min_price);
+        env.storage().persistent().set(&DataKey::PriceMax(asset.clone()), &max_price);
         PriceBoundsSetEvent { asset, min_price, max_price }.publish(&env);
         Ok(())
     }
 
     /// Retrieve price bounds for an asset. Returns `(Option<min>, Option<max>)`.
     pub fn get_price_bounds(env: Env, asset: Address) -> (Option<i128>, Option<i128>) {
-        let min = env.storage().persistent().get(&DataKey::PriceMin(asset));
+        let min = env.storage().persistent().get(&DataKey::PriceMin(asset.clone()));
         let max = env.storage().persistent().get(&DataKey::PriceMax(asset));
         (min, max)
     }
@@ -1186,10 +1189,9 @@ impl LendingContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::BadDebt, &new_bad_debt);
-            env.events().publish(
-                (Symbol::new(&env, "bad_debt"), borrower.clone()),
-                shortfall,
-            );
+            #[allow(deprecated)]
+            env.events()
+                .publish((Symbol::new(&env, "bad_debt"), borrower.clone()), shortfall);
             available_collateral
         } else {
             seized_collateral
@@ -1215,7 +1217,7 @@ impl LendingContract {
 
         let debt_token_client = TokenClient::new(&env, &debt_asset);
         let collateral_token_client = TokenClient::new(&env, &collateral_asset);
-        debt_token_client.transfer(&liquidator, &env.current_contract_address(), &actual_repay);
+        debt_token_client.transfer(&liquidator, env.current_contract_address(), &actual_repay);
         collateral_token_client.transfer(
             &env.current_contract_address(),
             &liquidator,
@@ -1302,7 +1304,7 @@ impl LendingContract {
     /// Set the flash loan fee in basis points (admin-only). Must be in [0, 1000].
     pub fn set_flash_fee(env: Env, fee_bps: i128) -> Result<(), LendingError> {
         assert_admin(&env);
-        if fee_bps < 0 || fee_bps > 1000 {
+        if !(0..=1000).contains(&fee_bps) {
             return Err(LendingError::InvalidFeeBps);
         }
         env.storage()
@@ -1429,8 +1431,9 @@ impl LendingContract {
         }
         let rate = current_borrow_rate(&env);
         // Clamp to zero: the protocol guarantees views never report negative debt.
-        let debt =
-            effective_debt(&position, env.ledger().timestamp(), rate).unwrap_or(position.principal).max(0);
+        let debt = effective_debt(&position, env.ledger().timestamp(), rate)
+            .unwrap_or(position.principal)
+            .max(0);
 
         let health_factor = if debt > 0 {
             col.checked_mul(LIQUIDATION_THRESHOLD_BPS)
@@ -1518,10 +1521,10 @@ impl LendingContract {
         if admin != Self::get_admin(env.clone()) {
             return Err(LendingError::Unauthorized);
         }
-        if ltv_bps < 0 || ltv_bps > 10000 {
+        if !(0..=10000).contains(&ltv_bps) {
             return Err(LendingError::InvalidAmount);
         }
-        if liquidation_threshold_bps < 0 || liquidation_threshold_bps > 10000 {
+        if !(0..=10000).contains(&liquidation_threshold_bps) {
             return Err(LendingError::InvalidAmount);
         }
         if debt_ceiling < 0 {
@@ -1897,11 +1900,17 @@ impl LendingContract {
         upgrade::get_upgrade_approvers(&env)
     }
 
-    pub fn get_proposal_approvals(env: Env, proposal_id: u64) -> Result<Vec<Address>, LendingError> {
+    pub fn get_proposal_approvals(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<Vec<Address>, LendingError> {
         upgrade::get_proposal_approvals(&env, proposal_id)
     }
 
-    pub fn upgrade_status(env: Env, proposal_id: u64) -> Result<upgrade::UpgradeStatus, LendingError> {
+    pub fn upgrade_status(
+        env: Env,
+        proposal_id: u64,
+    ) -> Result<upgrade::UpgradeStatus, LendingError> {
         upgrade::upgrade_status(&env, proposal_id)
     }
 
@@ -2012,7 +2021,8 @@ fn decrement_isolation_debt(env: &Env, collateral_asset: &Address, amount: i128)
     env.storage().persistent().set(&key, &updated);
 }
 
-fn extend_collateral_ttl(env: &Env, user: &Address) {    let key = DataKey::Collateral(user.clone());
+fn extend_collateral_ttl(env: &Env, user: &Address) {
+    let key = DataKey::Collateral(user.clone());
     let extend_to = env.storage().max_ttl().min(PERSISTENT_TTL_LEDGERS);
     let threshold = extend_to / 2 + 1;
     if env.storage().persistent().has(&key) {
@@ -2135,7 +2145,8 @@ fn assert_borrow_solvent(
 
     let now = env.ledger().timestamp();
     let rate = current_borrow_rate(env);
-    let new_debt = effective_debt(updated_position, now, rate).map_err(|_| LendingError::Overflow)?;
+    let new_debt =
+        effective_debt(updated_position, now, rate).map_err(|_| LendingError::Overflow)?;
 
     if new_debt > 0 {
         let weighted_collateral = collateral

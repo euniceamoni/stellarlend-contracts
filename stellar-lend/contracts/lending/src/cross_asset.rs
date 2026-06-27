@@ -1,13 +1,18 @@
 use soroban_sdk::{Address, Env, Vec};
 
-use crate::debt::{load_debt, DebtPosition, DEFAULT_APR_BPS};
+use crate::debt::{DebtPosition, DEFAULT_APR_BPS};
 use crate::{
     check_emergency_status, check_pause_status, AssetParams, DataKey, LendingError, PriceRecord,
     ProtocolAction,
 };
 
 const PRICE_DIVISOR: i128 = 10_000_000;
-const HEALTH_FACTOR_NO_DEBT: i128 = 100_000_000;
+/// Sentinel health factor returned when a user has zero outstanding debt.
+///
+/// Value: `100_000_000` (10 000× the [`HEALTH_FACTOR_SCALE`] baseline of 10 000).
+/// Callers should treat any value ≥ this constant as "position is fully healthy"
+/// and skip liquidation checks.
+pub const HEALTH_FACTOR_NO_DEBT: i128 = 100_000_000;
 pub const HEALTH_FACTOR_SCALE: i128 = 10_000;
 
 pub fn load_collateral_asset(env: &Env, user: &Address, asset: &Address) -> i128 {

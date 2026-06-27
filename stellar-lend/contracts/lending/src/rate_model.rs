@@ -1,5 +1,4 @@
-#![no_std]
-
+#[allow(unused_imports)]
 use soroban_sdk::{contracttype, Env};
 
 use stellar_lend_common::BPS_DENOM;
@@ -63,6 +62,13 @@ pub fn compute_borrow_rate(utilization_bps: i128, params: &RateParams) -> i128 {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_scval_conversion() {
+        use soroban_sdk::xdr::ScVal;
+        let params = RateParams::default();
+        let _scval = ScVal::try_from(&params).unwrap();
+    }
 
     fn default_params() -> RateParams {
         RateParams::default()
