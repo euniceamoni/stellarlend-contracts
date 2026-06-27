@@ -1,5 +1,31 @@
 use std::collections::HashMap;
 
+/// Error type returned by admin-gated and pause-gated operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VestingError {
+    /// The caller is not the configured admin.
+    Unauthorized,
+    /// Claim or revoke was attempted while the contract is paused.
+    ContractPaused,
+    /// The grant targeted by revoke does not exist.
+    NoSuchGrant,
+    /// All grants for the grantee are already revoked.
+    AlreadyRevoked,
+}
+
+impl core::fmt::Display for VestingError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            VestingError::Unauthorized => write!(f, "only admin can perform this action"),
+            VestingError::ContractPaused => {
+                write!(f, "contract is paused; claim and revoke are disabled")
+            }
+            VestingError::NoSuchGrant => write!(f, "no such grant"),
+            VestingError::AlreadyRevoked => write!(f, "already revoked"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
     pub grantee: String,
@@ -51,6 +77,9 @@ pub struct VestingContract {
     grants: HashMap<String, Vec<Grant>>,
     pub balances: HashMap<String, u128>,
     total_locked: u128,
+    /// When `true`, `claim` and `revoke` are blocked until the admin calls `resume`.
+    /// Vesting math (accrual) continues unaffected; only settlement is halted.
+    paused: bool,
 }
 
 impl VestingContract {
@@ -61,8 +90,63 @@ impl VestingContract {
             grants: HashMap::new(),
             balances: HashMap::new(),
             total_locked: 0,
+            paused: false,
         }
     }
+
+    // ── Pause / resume ────────────────────────────────────────────────────────
+
+    /// Pause the contract, blocking `claim` and `revoke` until `resume` is called.
+    ///
+    /// # Errors
+    /// Returns [`VestingError::Unauthorized`] if `caller` is not the admin.
+    ///
+    /// # Notes
+    /// Calling `pause` while already paused is a no-op (idempotent).
+    /// Accrued vesting math is not altered; only settlement is blocked.
+    pub fn pause(&mut self, caller: &str) -> Result<(), VestingError> {
+        if caller != self.admin {
+            return Err(VestingError::Unauthorized);
+        }
+        self.paused = true;
+        Ok(())
+    }
+
+    /// Resume the contract, re-enabling `claim` and `revoke`.
+    ///
+    /// # Errors
+    /// Returns [`VestingError::Unauthorized`] if `caller` is not the admin.
+    ///
+    /// # Notes
+    /// Calling `resume` while not paused is a no-op (idempotent).
+    pub fn resume(&mut self, caller: &str) -> Result<(), VestingError> {
+        if caller != self.admin {
+            return Err(VestingError::Unauthorized);
+        }
+        self.paused = false;
+        Ok(())
+    }
+
+    /// Returns `true` if the contract is currently paused.
+    ///
+    /// Frontends and integrators should query this before presenting claim or
+    /// revoke actions to users, so they can surface a clear "paused" message
+    /// instead of a failed transaction.
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Reject the call when the contract is paused.
+    fn check_not_paused(&self) -> Result<(), VestingError> {
+        if self.paused {
+            return Err(VestingError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    // ── Grant management ──────────────────────────────────────────────────────
 
     /// Adds a vesting schedule for `grantee` and increases the aggregate locked supply.
     pub fn add_grant(
@@ -98,11 +182,22 @@ impl VestingContract {
         }
     }
 
-    pub fn claim(&mut self, grantee: &str, now: u64) -> u128 {
+    /// Advance all vesting schedules for `grantee` to `now` and transfer any
+    /// newly claimable tokens to the grantee's balance.
+    ///
+    /// Returns the amount transferred on success, or `0` if there is nothing
+    /// claimable at this time.
+    ///
+    /// # Errors
+    /// Returns [`VestingError::ContractPaused`] while the admin pause is active.
+    /// No state is mutated when this error is returned.
+    pub fn claim(&mut self, grantee: &str, now: u64) -> Result<u128, VestingError> {
+        self.check_not_paused()?;
+
         self.sync_grants(grantee, now);
         let grants = match self.grants.get_mut(grantee) {
             Some(x) => x,
-            None => return 0,
+            None => return Ok(0),
         };
 
         let mut amount = 0;
@@ -116,7 +211,7 @@ impl VestingContract {
         }
 
         if amount == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let cbal = self.balances.entry("contract".to_string()).or_default();
@@ -125,18 +220,31 @@ impl VestingContract {
             let gbal = self.balances.entry(grantee.to_string()).or_default();
             *gbal += amount;
         }
-        amount
+        Ok(amount)
     }
 
-    pub fn revoke(&mut self, caller: &str, grantee: &str, now: u64) -> Result<u128, String> {
+    /// Revoke all active vesting schedules for `grantee`, transferring the
+    /// still-locked portion to the treasury address.
+    ///
+    /// # Errors
+    /// - [`VestingError::Unauthorized`] — `caller` is not the admin.
+    /// - [`VestingError::ContractPaused`] — the admin pause is active.
+    ///   No state is mutated when this error is returned.
+    /// - [`VestingError::NoSuchGrant`] — no schedules exist for `grantee`.
+    /// - [`VestingError::AlreadyRevoked`] — all schedules are already revoked.
+    pub fn revoke(&mut self, caller: &str, grantee: &str, now: u64) -> Result<u128, VestingError> {
         if caller != self.admin {
-            return Err("only admin can revoke".to_string());
+            return Err(VestingError::Unauthorized);
         }
+        // Pause check is performed after the auth check so that the error
+        // ordering is consistent: unauthorized callers never learn whether the
+        // contract is paused.
+        self.check_not_paused()?;
 
         self.sync_grants(grantee, now);
         let grants = match self.grants.get_mut(grantee) {
             Some(x) => x,
-            None => return Err("no such grant".to_string()),
+            None => return Err(VestingError::NoSuchGrant),
         };
 
         let mut transfer = 0;
@@ -154,7 +262,7 @@ impl VestingContract {
         }
 
         if !revoked_any {
-            return Err("already revoked".to_string());
+            return Err(VestingError::AlreadyRevoked);
         }
 
         let cbal = self.balances.entry("contract".to_string()).or_default();
@@ -189,7 +297,7 @@ mod tests {
     fn claim_before_cliff_is_zero() {
         let mut c = VestingContract::new("admin", "treasury");
         c.add_grant("alice", 1000, 1000, 1000, 200);
-        let claimed = c.claim("alice", 1100);
+        let claimed = c.claim("alice", 1100).expect("claim should not error");
         assert_eq!(claimed, 0);
         assert_eq!(c.balance_of("alice"), 0);
         assert_eq!(c.total_locked(), 1000);
@@ -199,7 +307,7 @@ mod tests {
     fn claim_after_cliff_partial() {
         let mut c = VestingContract::new("admin", "treasury");
         c.add_grant("bob", 1000, 1000, 1000, 100);
-        let claimed = c.claim("bob", 1200);
+        let claimed = c.claim("bob", 1200).expect("claim should not error");
         assert_eq!(claimed, 200);
         assert_eq!(c.balance_of("bob"), 200);
         assert_eq!(c.total_locked(), 800);
@@ -209,12 +317,12 @@ mod tests {
     fn revoke_claws_unvested_to_treasury() {
         let mut c = VestingContract::new("admin", "treasury");
         c.add_grant("carol", 1000, 1000, 1000, 100);
-        let _ = c.claim("carol", 1200);
+        let _ = c.claim("carol", 1200).expect("claim should not error");
         assert_eq!(c.balance_of("contract"), 800);
         let transferred = c.revoke("admin", "carol", 1200).expect("revoke failed");
         assert_eq!(transferred, 800);
         assert_eq!(c.balance_of("treasury"), 800);
-        assert_eq!(c.claim("carol", 1300), 0);
+        assert_eq!(c.claim("carol", 1300).expect("claim should not error"), 0);
         assert_eq!(c.total_locked(), 0);
     }
 
@@ -223,10 +331,13 @@ mod tests {
         let mut c = VestingContract::new("admin", "treasury");
         c.add_grant("dan", 500, 0, 100, 0);
         let res = c.revoke("not-admin", "dan", 10);
-        assert!(res.is_err());
+        assert_eq!(res, Err(VestingError::Unauthorized));
         assert_eq!(c.total_locked(), 500);
     }
 }
+
+#[cfg(test)]
+mod pause_test;
 
 #[cfg(test)]
 mod vesting_views_test;
