@@ -46,6 +46,9 @@ pub mod withdraw;
 #[cfg(test)]
 mod twap_tests;
 
+#[cfg(test)]
+mod bridge_fee_test;
+
 // Legacy test suite currently mismatches contract API and is excluded from CI compile.
 // #[cfg(test)]
 // mod tests;
