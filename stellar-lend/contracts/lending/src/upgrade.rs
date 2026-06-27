@@ -231,7 +231,7 @@ pub fn upgrade_add_approver(
         .get(&UpgradeKey::Approvers)
         .unwrap_or_else(|| Vec::new(env));
 
-    if approvers.len() >= MAX_APPROVERS as u32 {
+    if approvers.len() >= MAX_APPROVERS {
         return Err(LendingError::MaxApproversReached);
     }
     if approvers.contains(&approver) {
@@ -267,7 +267,7 @@ pub fn upgrade_remove_approver(
         .instance()
         .get(&UpgradeKey::RequiredApprovals)
         .unwrap_or(1);
-    let mut approvers: Vec<Address> = env
+    let approvers: Vec<Address> = env
         .storage()
         .instance()
         .get(&UpgradeKey::Approvers)

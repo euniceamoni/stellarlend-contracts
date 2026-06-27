@@ -1,6 +1,4 @@
-#![no_std]
-
-use soroban_sdk::{contracttype, Env};
+use soroban_sdk::contracttype;
 
 use stellar_lend_common::BPS_DENOM;
 

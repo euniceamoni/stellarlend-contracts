@@ -81,7 +81,7 @@ use debt::{
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address,
     Bytes, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
 
@@ -519,7 +519,7 @@ impl LendingContract {
     /// The requested amount must not exceed `max_flash_bps × available_liquidity / 10000`.
     pub fn set_max_flash_bps(env: Env, max_flash_bps: i128) -> Result<(), LendingError> {
         assert_admin(&env);
-        if max_flash_bps < 0 || max_flash_bps > BPS_DENOM {
+        if !(0..=BPS_DENOM).contains(&max_flash_bps) {
             return Err(LendingError::InvalidFlashUtilizationBps);
         }
         env.storage()
@@ -1115,6 +1115,7 @@ impl LendingContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::BadDebt, &new_bad_debt);
+            #[allow(deprecated)]
             env.events()
                 .publish((Symbol::new(&env, "bad_debt"), borrower.clone()), shortfall);
             available_collateral
@@ -1142,7 +1143,7 @@ impl LendingContract {
 
         let debt_token_client = TokenClient::new(&env, &debt_asset);
         let collateral_token_client = TokenClient::new(&env, &collateral_asset);
-        debt_token_client.transfer(&liquidator, &env.current_contract_address(), &actual_repay);
+        debt_token_client.transfer(&liquidator, env.current_contract_address(), &actual_repay);
         collateral_token_client.transfer(
             &env.current_contract_address(),
             &liquidator,
@@ -1229,7 +1230,7 @@ impl LendingContract {
     /// Set the flash loan fee in basis points (admin-only). Must be in [0, 1000].
     pub fn set_flash_fee(env: Env, fee_bps: i128) -> Result<(), LendingError> {
         assert_admin(&env);
-        if fee_bps < 0 || fee_bps > 1000 {
+        if !(0..=1000).contains(&fee_bps) {
             return Err(LendingError::InvalidFeeBps);
         }
         env.storage()
@@ -1446,10 +1447,10 @@ impl LendingContract {
         if admin != Self::get_admin(env.clone()) {
             return Err(LendingError::Unauthorized);
         }
-        if ltv_bps < 0 || ltv_bps > 10000 {
+        if !(0..=10000).contains(&ltv_bps) {
             return Err(LendingError::InvalidAmount);
         }
-        if liquidation_threshold_bps < 0 || liquidation_threshold_bps > 10000 {
+        if !(0..=10000).contains(&liquidation_threshold_bps) {
             return Err(LendingError::InvalidAmount);
         }
         if debt_ceiling < 0 {

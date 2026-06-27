@@ -9,7 +9,7 @@
 use soroban_sdk::contracterror;
 
 /// Fixed-point scale for internal calculations (7 decimals)
-pub const SCALE: i128 = 1_000_000_0; // 10^7
+pub const SCALE: i128 = 10_000_000; // 10^7
 
 /// Basis points scale (100% = 10000 bps)
 pub const BPS_SCALE: u32 = 10000;
@@ -53,7 +53,7 @@ pub fn compute_compound_interest(
     if principal < 0 {
         return Err(MathError::OutOfRange);
     }
-    if rate_bps < 0 || rate_bps > MAX_RATE_BPS {
+    if !(0..=MAX_RATE_BPS).contains(&rate_bps) {
         return Err(MathError::OutOfRange);
     }
     if elapsed == 0 {
@@ -125,7 +125,7 @@ pub fn compute_health_factor(
     }
 
     // Compute: (collateral_value * liquidation_threshold_bps) / BPS_SCALE
-    let weighted_collateral = (collateral_value as i128)
+    let weighted_collateral = collateral_value
         .checked_mul(liquidation_threshold_bps as i128)
         .ok_or(MathError::Overflow)?
         .checked_div(BPS_SCALE as i128)
